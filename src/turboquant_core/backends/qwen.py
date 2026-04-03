@@ -8,6 +8,8 @@ K → TQ_prod (MSE + QJL) for unbiased softmax(QK^T)
 V → TQ_MSE only (weighted average, no inner product to debias)
 """
 
+import math
+
 from ..core import (
     CodebookRegistry, RotationCache, QJLProjection,
     tq_quantize_mse, tq_dequantize_mse, tq_quantize_prod,
@@ -54,6 +56,32 @@ class Qwen35KVBackend:
         Vf = tq_dequantize_mse(compressed["v_idx"], compressed["v_n"], self.v_cb, self.v_rot)
         return Vf.reshape(compressed["shape"])
 
+    def compute_attention_scores(self, Q: torch.Tensor, compressed: dict) -> torch.Tensor:
+        """Compute unbiased Q @ K^T from fresh Q and compressed K using QJL correction.
+
+        Q shape: [batch, num_heads, q_len, head_dim]
+        Returns: [batch, num_heads, q_len, kv_len]
+        """
+        b, nh, kv_len, hd = compressed["shape"]
+        q_len = Q.shape[2]
+
+        K_mse = tq_dequantize_mse(
+            compressed["k_mse"], compressed["k_n"], self.k_cb, self.k_rot
+        ).reshape(compressed["shape"])
+        scores_mse = Q @ K_mse.transpose(-2, -1)
+
+        Q_flat = Q.reshape(b * nh * q_len, hd)
+        Q_qjl = self.k_qjl.quantize(Q_flat).reshape(b * nh, q_len, hd)
+        k_qjl = compressed["k_qjl"].reshape(b * nh, kv_len, hd)
+
+        correction = Q_qjl.float() @ k_qjl.float().transpose(-2, -1)
+        correction = correction * (math.pi / (2 * hd))
+        correction = correction * compressed["k_rn"].reshape(b * nh, 1, kv_len)
+        correction = correction * compressed["k_n"].reshape(b * nh, 1, kv_len)
+        correction = correction.reshape(b, nh, q_len, kv_len)
+
+        return scores_mse + correction
+
 
 class Qwen3DenseKVBackend:
     """KV cache compression for Qwen3-8B (dense, all 36 layers uniform)."""
@@ -86,3 +114,25 @@ class Qwen3DenseKVBackend:
     def decompress_v(self, compressed):
         Vf = tq_dequantize_mse(compressed["v_idx"], compressed["v_n"], self.v_cb, self.v_rot)
         return Vf.reshape(compressed["shape"])
+
+    def compute_attention_scores(self, Q: torch.Tensor, compressed: dict) -> torch.Tensor:
+        """Compute unbiased Q @ K^T from fresh Q and compressed K using QJL correction."""
+        b, nh, kv_len, hd = compressed["shape"]
+        q_len = Q.shape[2]
+
+        K_mse = tq_dequantize_mse(
+            compressed["k_mse"], compressed["k_n"], self.k_cb, self.k_rot
+        ).reshape(compressed["shape"])
+        scores_mse = Q @ K_mse.transpose(-2, -1)
+
+        Q_flat = Q.reshape(b * nh * q_len, hd)
+        Q_qjl = self.k_qjl.quantize(Q_flat).reshape(b * nh, q_len, hd)
+        k_qjl = compressed["k_qjl"].reshape(b * nh, kv_len, hd)
+
+        correction = Q_qjl.float() @ k_qjl.float().transpose(-2, -1)
+        correction = correction * (math.pi / (2 * hd))
+        correction = correction * compressed["k_rn"].reshape(b * nh, 1, kv_len)
+        correction = correction * compressed["k_n"].reshape(b * nh, 1, kv_len)
+        correction = correction.reshape(b, nh, q_len, kv_len)
+
+        return scores_mse + correction
