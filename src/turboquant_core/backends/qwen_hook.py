@@ -1,28 +1,32 @@
 """
-Hook-in module for patching Qwen3.5-9B to use TurboQuant compressed KV cache.
+Hook-in module for patching Qwen models to use TurboQuant compressed KV cache.
 
 Usage:
     from transformers import AutoModelForCausalLM
-    from turboquant_core.backends.qwen_hook import patch_qwen35_with_tq
+    from turboquant_core.backends.qwen_hook import patch_qwen35_with_tq, patch_qwen3_with_tq
 
+    # Qwen3.5-9B (hybrid: 8 GatedAttn layers compressed, DeltaNet layers unchanged)
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-9B", ...)
     cache = patch_qwen35_with_tq(model, bit_width=4)
+
+    # Qwen3-8B (dense: all 36 layers compressed)
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", ...)
+    cache = patch_qwen3_with_tq(model, bit_width=4)
 
     # Now model.generate() uses compressed KV cache automatically.
     # cache.clear() between generations.
 
-This module monkey-patches the GatedAttn layers' attention forward to:
+This module monkey-patches attention layers' forward to:
 1. Compress K/V into the TQQuantizedCache after projection
 2. Use QJL-corrected attention scores for K (instead of raw matmul)
 3. Decompress V for the attention output
-4. Pass through DeltaNet layers unchanged
+4. Pass through non-compressible layers unchanged (Qwen3.5-9B DeltaNet layers)
 
-Requires: transformers with Qwen3.5 support.
+Requires: transformers with Qwen3/Qwen3.5 support.
 """
 
 import math
 import functools
-from typing import Optional
 
 import torch
 
@@ -70,6 +74,46 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None):
             continue
 
         # Patch the attention forward
+        _patch_attention_forward(attn, cache, layer_idx)
+
+    return cache
+
+
+def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None):
+    """Patch a Qwen3-8B model to use TurboQuant compressed KV cache.
+
+    All 36 layers are dense attention and compressible.
+
+    Args:
+        model: A Qwen3 CausalLM model from transformers.
+        bit_width: Total bits per value (K gets b-1 MSE + 1 QJL, V gets b MSE).
+        seed: Random seed for rotation and QJL matrices.
+        device: Device for TQ buffers. Defaults to model's device.
+
+    Returns:
+        TQQuantizedCache instance. Call cache.clear() between generations.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    cache = TQQuantizedCache(
+        num_layers=36, interval=1,
+        kv_head_dim=128, num_kv_heads=8,
+        bit_width=bit_width, seed=seed, device=device,
+    )
+
+    layers = _get_model_layers(model)
+    if layers is None:
+        raise ValueError(
+            "Could not find transformer layers in model. "
+            "Expected model.model.layers or similar structure."
+        )
+
+    for layer_idx, layer in enumerate(layers):
+        attn = _get_attention_module(layer)
+        if attn is None:
+            continue
+
         _patch_attention_forward(attn, cache, layer_idx)
 
     return cache
@@ -145,15 +189,11 @@ def _patch_attention_forward(attn_module, cache, layer_idx):
         cache.update(K, V, layer_idx)
 
         # Compute attention using the full cache (including previous tokens)
-        attn_output = cache.compute_attention(Q, layer_idx)
-
-        # GQA: attn_output is [batch, num_kv_heads, q_len, head_dim]
-        # Need to expand if num_q_heads > num_kv_heads
         if num_q_heads != num_kv_heads:
-            # For GQA, Q was [batch, num_q_heads, ...] but cache.compute_attention
-            # operates at KV head granularity. We need the full Q @ K^T with GQA expansion.
-            # Fall back to manual attention with GQA for correctness.
+            # GQA: Q has more heads than K/V, need manual head expansion
             attn_output = _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads)
+        else:
+            attn_output = cache.compute_attention(Q, layer_idx)
 
         # Reshape back: [batch, heads, seq_len, head_dim] -> [batch, seq_len, hidden_dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -194,20 +234,25 @@ def _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads):
         scores_mse = Q @ K_mse_expanded.transpose(-2, -1)
 
         # QJL correction at KV head granularity, then expand
+        # Compressed data is flat [bsz * num_kv_heads * kv_len, ...]; reshape to per-head
+        k_qjl_all = entry["k_qjl"].reshape(bsz, num_kv_heads, kv_len, head_dim)
+        k_rn_all = entry["k_rn"].reshape(bsz, num_kv_heads, kv_len)
+        k_n_all = entry["k_n"].reshape(bsz, num_kv_heads, kv_len)
+
         Q_grouped = Q.reshape(bsz, num_kv_heads, num_groups, q_len, head_dim)
         correction_per_kv = []
         for g in range(num_kv_heads):
             Q_g = Q_grouped[:, g].reshape(bsz * num_groups * q_len, head_dim)
             Q_qjl = cache.k_qjl.quantize(Q_g).reshape(bsz * num_groups, q_len, head_dim)
-            k_qjl = entry["k_qjl"].reshape(bsz, kv_len, head_dim)
-            # Need per-batch k_qjl for this KV head
-            k_qjl_g = k_qjl[:, :, :].unsqueeze(1).expand(-1, num_groups, -1, -1)
+
+            # Per KV head g: [bsz, kv_len, head_dim] -> expand for groups
+            k_qjl_g = k_qjl_all[:, g].unsqueeze(1).expand(-1, num_groups, -1, -1)
             k_qjl_g = k_qjl_g.reshape(bsz * num_groups, kv_len, head_dim)
 
             corr = Q_qjl.float() @ k_qjl_g.float().transpose(-2, -1)
             corr = corr * (math.pi / (2 * head_dim))
-            k_rn_g = entry["k_rn"].reshape(bsz, kv_len).unsqueeze(1).expand(-1, num_groups, -1)
-            k_n_g = entry["k_n"].reshape(bsz, kv_len).unsqueeze(1).expand(-1, num_groups, -1)
+            k_rn_g = k_rn_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
+            k_n_g = k_n_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
             corr = corr * k_rn_g.reshape(bsz * num_groups, 1, kv_len)
             corr = corr * k_n_g.reshape(bsz * num_groups, 1, kv_len)
             correction_per_kv.append(corr.reshape(bsz, num_groups, q_len, kv_len))

@@ -127,7 +127,7 @@ def test_mse_no_nan():
         x_hat = tq_dequantize_mse(indices, norms, cb, rot)
         assert not torch.isnan(x_hat).any(), f"NaN in {label} output"
         assert not torch.isinf(x_hat).any(), f"Inf in {label} output"
-    print(f"  No NaN/Inf on random and zero inputs — OK")
+    print("  No NaN/Inf on random and zero inputs — OK")
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +143,7 @@ def test_qjl_output_shape():
     assert bits.shape == x.shape
     assert bits.dtype == torch.int8
     assert set(bits.unique().tolist()).issubset({-1, 0, 1})
-    print(f"  QJL output shape and dtype — OK")
+    print("  QJL output shape and dtype — OK")
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def test_tq_prod_components():
     assert norms.shape == (64,)
     assert mse_idx.dtype == torch.uint8
     assert qjl_bits.dtype == torch.int8
-    print(f"  TQ_prod components: shapes and dtypes — OK")
+    print("  TQ_prod components: shapes and dtypes — OK")
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ def test_qwen3_dense_all_compressible():
     """Qwen3-8B: all 36 layers compressible."""
     backend = Qwen3DenseKVBackend()
     assert all(backend.is_compressible(i) for i in range(36))
-    print(f"  Qwen3-8B all 36 layers compressible — OK")
+    print("  Qwen3-8B all 36 layers compressible — OK")
 
 
 def test_qwen35_compress_decompress_v_shape():
@@ -208,7 +208,7 @@ def test_qwen35_compress_decompress_v_no_nan_zeros():
     V_out = backend.decompress_v(compressed)
     assert not torch.isnan(V_out).any(), "NaN in V output from zero inputs"
     assert not torch.isinf(V_out).any(), "Inf in V output from zero inputs"
-    print(f"  Qwen3.5-9B no NaN on zero inputs — OK")
+    print("  Qwen3.5-9B no NaN on zero inputs — OK")
 
 
 def test_qwen3_dense_compress_decompress_v_shape():
@@ -285,7 +285,7 @@ def test_k_v_asymmetry():
     assert "v_n" in compressed, "V should have norms"
     # V should NOT have QJL
     assert "v_qjl" not in compressed, "V should NOT have QJL bits"
-    print(f"  K/V asymmetry: K has QJL, V does not — OK")
+    print("  K/V asymmetry: K has QJL, V does not — OK")
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +298,8 @@ def test_fast_wht_matches_dense():
     x = torch.randn(8, d)
     # Build dense Hadamard for reference
     def hadamard(n):
-        if n == 1: return torch.tensor([[1.0]])
+        if n == 1:
+            return torch.tensor([[1.0]])
         h = hadamard(n // 2)
         return torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
     H = hadamard(d)
@@ -316,7 +317,7 @@ def test_fast_wht_no_matrix_stored():
     assert "signs" in rot
     assert "d" in rot
     assert "d_padded" in rot
-    print(f"  RotationCache stores no dense matrix — OK")
+    print("  RotationCache stores no dense matrix — OK")
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +334,7 @@ def test_quantized_cache_compressed_update():
     # Should be a dict (compressed), not a tuple (raw)
     assert isinstance(cache._cache[3], dict)
     assert "k_mse" in cache._cache[3]
-    print(f"  TQQuantizedCache compressed storage — OK")
+    print("  TQQuantizedCache compressed storage — OK")
 
 
 def test_quantized_cache_raw_update():
@@ -344,7 +345,7 @@ def test_quantized_cache_raw_update():
     cache.update(K, V, layer_idx=0)  # DeltaNet layer
     assert cache.get_seq_length(0) == 8
     assert isinstance(cache._cache[0], tuple)
-    print(f"  TQQuantizedCache raw storage for DeltaNet — OK")
+    print("  TQQuantizedCache raw storage for DeltaNet — OK")
 
 
 def test_quantized_cache_incremental():
@@ -357,7 +358,7 @@ def test_quantized_cache_incremental():
     cache.update(K1, V1, layer_idx=3)
     cache.update(K2, V2, layer_idx=3)
     assert cache.get_seq_length(3) == 15
-    print(f"  TQQuantizedCache incremental: 10+5=15 tokens — OK")
+    print("  TQQuantizedCache incremental: 10+5=15 tokens — OK")
 
 
 def test_quantized_cache_compute_attention():
@@ -393,7 +394,7 @@ def test_quantized_cache_clear():
     cache.clear()
     assert cache.get_seq_length(3) == 0
     assert cache._cache[3] is None
-    print(f"  TQQuantizedCache clear — OK")
+    print("  TQQuantizedCache clear — OK")
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +462,7 @@ def test_paper_table2_codebook_centroids():
         for c, e in zip(centroids, expected_c):
             assert abs(c - e) < 0.01, f"b={b}: centroid {c} != {e}"
         assert abs(mse - expected_mse) < 0.005, f"b={b}: MSE {mse} != {expected_mse}"
-    print(f"  Paper Table 2 centroids b=1..3 — OK")
+    print("  Paper Table 2 centroids b=1..3 — OK")
 
 
 def test_paper_table2_mse_round_trip():
@@ -485,7 +486,7 @@ def test_paper_table2_mse_round_trip():
     assert results[4] < 0.02, f"b=4 MSE too high: {results[4]}"
     # b=1 should be much higher
     assert results[1] > 0.1, f"b=1 MSE too low: {results[1]}"
-    print(f"  MSE/coord by bit_width: " +
+    print("  MSE/coord by bit_width: " +
           ", ".join(f"b={b}={v:.4f}" for b, v in results.items()) + " — OK")
 
 
@@ -568,7 +569,7 @@ def test_adapter_interface_contract():
         assert isinstance(V_out, torch.Tensor), f"{name}.decompress_v should return Tensor"
         assert V_out.shape == V.shape, f"{name}.decompress_v shape mismatch"
 
-    print(f"  Adapter interface contract verified for both backends — OK")
+    print("  Adapter interface contract verified for both backends — OK")
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +588,7 @@ def test_bit_width_kv_asymmetry_semantics():
         f"V should have 16 centroids (4-bit), got {backend.v_cb.centroids.shape[0]}"
     assert backend.v_cb.bit_width == 4
     # Effective: K = 3 MSE + 1 QJL = 4 bits total, V = 4 MSE = 4 bits total
-    print(f"  bit_width=4: K=3-bit MSE + 1-bit QJL, V=4-bit MSE — OK")
+    print("  bit_width=4: K=3-bit MSE + 1-bit QJL, V=4-bit MSE — OK")
 
 
 # ---------------------------------------------------------------------------
