@@ -6,15 +6,18 @@ import numpy as np
 
 from turboquant_core.core import (
     _lloyd_max_gaussian,
+    _fast_wht,
     CodebookRegistry,
     RotationCache,
     tq_rotate,
     tq_rotate_inv,
     tq_quantize_mse,
     tq_dequantize_mse,
+    tq_quantize_mse_ste,
     QJLProjection,
     tq_quantize_prod,
     TQGatedAttnKVCache,
+    TQQuantizedCache,
 )
 from turboquant_core.backends.qwen import Qwen35KVBackend, Qwen3DenseKVBackend
 
@@ -286,6 +289,161 @@ def test_k_v_asymmetry():
 
 
 # ---------------------------------------------------------------------------
+# Fast Walsh-Hadamard transform tests
+# ---------------------------------------------------------------------------
+
+def test_fast_wht_matches_dense():
+    """Fast WHT should produce same result as dense Hadamard matrix multiply."""
+    d = 16
+    x = torch.randn(8, d)
+    # Build dense Hadamard for reference
+    def hadamard(n):
+        if n == 1: return torch.tensor([[1.0]])
+        h = hadamard(n // 2)
+        return torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    H = hadamard(d)
+    expected = x @ H.T
+    got = _fast_wht(x)
+    max_err = (expected - got).abs().max().item()
+    assert max_err < 1e-5, f"Fast WHT vs dense error: {max_err}"
+    print(f"  Fast WHT matches dense Hadamard (d={d}): max_err={max_err:.2e} — OK")
+
+
+def test_fast_wht_no_matrix_stored():
+    """RotationCache should not store a Hadamard matrix with fast WHT."""
+    rot = RotationCache.get(256, seed=99)
+    assert "H" not in rot, "RotationCache should not store dense Hadamard matrix"
+    assert "signs" in rot
+    assert "d" in rot
+    assert "d_padded" in rot
+    print(f"  RotationCache stores no dense matrix — OK")
+
+
+# ---------------------------------------------------------------------------
+# TQQuantizedCache tests
+# ---------------------------------------------------------------------------
+
+def test_quantized_cache_compressed_update():
+    """TQQuantizedCache stores compressed data for GatedAttn layers."""
+    cache = TQQuantizedCache()
+    K = torch.randn(1, 4, 16, 256)
+    V = torch.randn(1, 4, 16, 256)
+    cache.update(K, V, layer_idx=3)
+    assert cache.get_seq_length(3) == 16
+    # Should be a dict (compressed), not a tuple (raw)
+    assert isinstance(cache._cache[3], dict)
+    assert "k_mse" in cache._cache[3]
+    print(f"  TQQuantizedCache compressed storage — OK")
+
+
+def test_quantized_cache_raw_update():
+    """TQQuantizedCache stores raw tensors for non-compressible layers."""
+    cache = TQQuantizedCache()
+    K = torch.randn(1, 4, 8, 256)
+    V = torch.randn(1, 4, 8, 256)
+    cache.update(K, V, layer_idx=0)  # DeltaNet layer
+    assert cache.get_seq_length(0) == 8
+    assert isinstance(cache._cache[0], tuple)
+    print(f"  TQQuantizedCache raw storage for DeltaNet — OK")
+
+
+def test_quantized_cache_incremental():
+    """TQQuantizedCache supports incremental token updates."""
+    cache = TQQuantizedCache()
+    K1 = torch.randn(1, 4, 10, 256)
+    V1 = torch.randn(1, 4, 10, 256)
+    K2 = torch.randn(1, 4, 5, 256)
+    V2 = torch.randn(1, 4, 5, 256)
+    cache.update(K1, V1, layer_idx=3)
+    cache.update(K2, V2, layer_idx=3)
+    assert cache.get_seq_length(3) == 15
+    print(f"  TQQuantizedCache incremental: 10+5=15 tokens — OK")
+
+
+def test_quantized_cache_compute_attention():
+    """TQQuantizedCache.compute_attention returns correct shape."""
+    cache = TQQuantizedCache()
+    K = torch.randn(1, 4, 32, 256)
+    V = torch.randn(1, 4, 32, 256)
+    Q = torch.randn(1, 4, 1, 256)
+    cache.update(K, V, layer_idx=3)
+    out = cache.compute_attention(Q, layer_idx=3)
+    assert out.shape == (1, 4, 1, 256), f"Output shape: {out.shape}"
+    assert not torch.isnan(out).any()
+    print(f"  TQQuantizedCache compute_attention: {out.shape} — OK")
+
+
+def test_quantized_cache_compute_attention_raw():
+    """TQQuantizedCache.compute_attention works for raw (non-compressed) layers."""
+    cache = TQQuantizedCache()
+    K = torch.randn(1, 4, 16, 256)
+    V = torch.randn(1, 4, 16, 256)
+    Q = torch.randn(1, 4, 1, 256)
+    cache.update(K, V, layer_idx=0)
+    out = cache.compute_attention(Q, layer_idx=0)
+    assert out.shape == (1, 4, 1, 256)
+    assert not torch.isnan(out).any()
+    print(f"  TQQuantizedCache raw attention: {out.shape} — OK")
+
+
+def test_quantized_cache_clear():
+    """TQQuantizedCache.clear resets all layers."""
+    cache = TQQuantizedCache()
+    cache.update(torch.randn(1, 4, 8, 256), torch.randn(1, 4, 8, 256), 3)
+    cache.clear()
+    assert cache.get_seq_length(3) == 0
+    assert cache._cache[3] is None
+    print(f"  TQQuantizedCache clear — OK")
+
+
+# ---------------------------------------------------------------------------
+# STE gradient tests
+# ---------------------------------------------------------------------------
+
+def test_ste_forward_matches_hard():
+    """STE forward should produce same output as hard quantize+dequantize."""
+    d = 128
+    cb = CodebookRegistry.get(d, 4)
+    rot = RotationCache.get(d, seed=42)
+    x = torch.randn(32, d)
+    # Hard round-trip
+    idx, norms = tq_quantize_mse(x, cb, rot)
+    x_hard = tq_dequantize_mse(idx, norms, cb, rot)
+    # STE round-trip
+    x_ste = tq_quantize_mse_ste(x, cb, rot)
+    max_err = (x_hard - x_ste).abs().max().item()
+    assert max_err < 1e-6, f"STE forward mismatch: {max_err}"
+    print(f"  STE forward matches hard quantization: max_err={max_err:.2e} — OK")
+
+
+def test_ste_gradient_flows():
+    """STE should allow gradients to flow through quantization."""
+    d = 128
+    cb = CodebookRegistry.get(d, 4)
+    rot = RotationCache.get(d, seed=42)
+    x = torch.randn(16, d, requires_grad=True)
+    x_hat = tq_quantize_mse_ste(x, cb, rot)
+    loss = x_hat.sum()
+    loss.backward()
+    assert x.grad is not None, "Gradient should flow through STE"
+    assert not torch.isnan(x.grad).any(), "NaN in STE gradient"
+    assert x.grad.abs().sum() > 0, "Gradient should be non-zero"
+    print(f"  STE gradient flows: grad norm={x.grad.norm().item():.4f} — OK")
+
+
+def test_ste_gradient_shape():
+    """STE gradient should have same shape as input."""
+    d = 256
+    cb = CodebookRegistry.get(d, 4)
+    rot = RotationCache.get(d, seed=42)
+    x = torch.randn(8, d, requires_grad=True)
+    x_hat = tq_quantize_mse_ste(x, cb, rot)
+    (x_hat ** 2).sum().backward()
+    assert x.grad.shape == x.shape
+    print(f"  STE gradient shape: {x.grad.shape} — OK")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -310,6 +468,20 @@ if __name__ == "__main__":
         test_qwen3_dense_compute_attention_scores_shape,
         test_cache_compute_attention_scores,
         test_k_v_asymmetry,
+        # Fast WHT tests
+        test_fast_wht_matches_dense,
+        test_fast_wht_no_matrix_stored,
+        # TQQuantizedCache tests
+        test_quantized_cache_compressed_update,
+        test_quantized_cache_raw_update,
+        test_quantized_cache_incremental,
+        test_quantized_cache_compute_attention,
+        test_quantized_cache_compute_attention_raw,
+        test_quantized_cache_clear,
+        # STE gradient tests
+        test_ste_forward_matches_hard,
+        test_ste_gradient_flows,
+        test_ste_gradient_shape,
     ]
 
     print(f"Running {len(tests)} tests...\n")
