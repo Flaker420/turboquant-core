@@ -1,0 +1,88 @@
+"""
+TurboQuant backend for Qwen3.5-9B hybrid architecture.
+
+Compresses KV cache on the 8 GatedAttn layers (indices 3,7,11,15,19,23,27,31).
+DeltaNet layers have no KV cache (opaque recurrent state in flash-linear-attention).
+
+K → TQ_prod (MSE + QJL) for unbiased softmax(QK^T)
+V → TQ_MSE only (weighted average, no inner product to debias)
+"""
+
+from ..core import (
+    CodebookRegistry, RotationCache, QJLProjection,
+    tq_quantize_mse, tq_dequantize_mse, tq_quantize_prod,
+)
+import torch
+
+
+class Qwen35KVBackend:
+    """KV cache compression for Qwen3.5-9B GatedAttn layers."""
+
+    MODEL_ID = "Qwen/Qwen3.5-9B"
+    NUM_LAYERS = 32
+    FULL_ATTN_INTERVAL = 4
+    GA_KV_HEADS = 4
+    GA_HEAD_DIM = 256
+
+    def __init__(self, bit_width: int = 4, seed: int = 42,
+                 device: torch.device = torch.device("cpu")):
+        self.ga_indices = {i for i in range(self.NUM_LAYERS)
+                          if (i + 1) % self.FULL_ATTN_INTERVAL == 0}
+        d = self.GA_HEAD_DIM
+
+        self.k_cb = CodebookRegistry.get(d, bit_width - 1, device)
+        self.k_rot = RotationCache.get(d, seed, device)
+        self.k_qjl = QJLProjection(d, seed=seed + 50, device=device)
+
+        self.v_cb = CodebookRegistry.get(d, bit_width, device)
+        self.v_rot = RotationCache.get(d, seed + 100, device)
+
+    def is_compressible(self, layer_idx: int) -> bool:
+        return layer_idx in self.ga_indices
+
+    def compress(self, K: torch.Tensor, V: torch.Tensor, layer_idx: int) -> dict:
+        """K, V shape: [batch, num_heads, seq_len, head_dim]"""
+        assert self.is_compressible(layer_idx)
+        b, nh, sl, hd = K.shape
+        Kf, Vf = K.reshape(-1, hd), V.reshape(-1, hd)
+        k_mse, k_qjl, k_rn, k_n = tq_quantize_prod(Kf, self.k_cb, self.k_rot, self.k_qjl)
+        v_idx, v_n = tq_quantize_mse(Vf, self.v_cb, self.v_rot)
+        return {"k_mse": k_mse, "k_qjl": k_qjl, "k_rn": k_rn, "k_n": k_n,
+                "v_idx": v_idx, "v_n": v_n, "shape": K.shape}
+
+    def decompress_v(self, compressed: dict) -> torch.Tensor:
+        Vf = tq_dequantize_mse(compressed["v_idx"], compressed["v_n"], self.v_cb, self.v_rot)
+        return Vf.reshape(compressed["shape"])
+
+
+class Qwen3DenseKVBackend:
+    """KV cache compression for Qwen3-8B (dense, all 36 layers uniform)."""
+
+    MODEL_ID = "Qwen/Qwen3-8B"
+    NUM_LAYERS = 36
+    KV_HEADS = 8
+    HEAD_DIM = 128
+
+    def __init__(self, bit_width: int = 4, seed: int = 42,
+                 device: torch.device = torch.device("cpu")):
+        d = self.HEAD_DIM
+        self.k_cb = CodebookRegistry.get(d, bit_width - 1, device)
+        self.k_rot = RotationCache.get(d, seed, device)
+        self.k_qjl = QJLProjection(d, seed=seed + 50, device=device)
+        self.v_cb = CodebookRegistry.get(d, bit_width, device)
+        self.v_rot = RotationCache.get(d, seed + 100, device)
+
+    def is_compressible(self, layer_idx: int) -> bool:
+        return True  # All layers have KV cache
+
+    def compress(self, K, V, layer_idx):
+        b, nh, sl, hd = K.shape
+        Kf, Vf = K.reshape(-1, hd), V.reshape(-1, hd)
+        k_mse, k_qjl, k_rn, k_n = tq_quantize_prod(Kf, self.k_cb, self.k_rot, self.k_qjl)
+        v_idx, v_n = tq_quantize_mse(Vf, self.v_cb, self.v_rot)
+        return {"k_mse": k_mse, "k_qjl": k_qjl, "k_rn": k_rn, "k_n": k_n,
+                "v_idx": v_idx, "v_n": v_n, "shape": K.shape}
+
+    def decompress_v(self, compressed):
+        Vf = tq_dequantize_mse(compressed["v_idx"], compressed["v_n"], self.v_cb, self.v_rot)
+        return Vf.reshape(compressed["shape"])

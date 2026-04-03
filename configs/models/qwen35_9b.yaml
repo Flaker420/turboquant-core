@@ -1,0 +1,16 @@
+# Qwen3.5-9B KV cache compression config
+# Probe-verified dimensions
+
+model:
+  name: "Qwen/Qwen3.5-9B"
+  num_layers: 32
+  full_attention_interval: 4
+  gated_attn_indices: [3, 7, 11, 15, 19, 23, 27, 31]
+
+kv_cache:
+  method: "turboquant_prod"
+  bit_width: 4                  # 3-bit MSE + 1-bit QJL
+  kv_heads: 4
+  head_dim: 256                 # probe-verified
+  compressible_layers: 8        # only GatedAttn layers have KV cache
+  # DeltaNet state is kernel-managed (opaque, not compressible)
