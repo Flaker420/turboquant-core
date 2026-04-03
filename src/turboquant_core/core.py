@@ -114,8 +114,27 @@ class CodebookRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Rotation cache
+# Rotation cache (fast Walsh-Hadamard transform)
 # ---------------------------------------------------------------------------
+
+def _fast_wht(x):
+    """In-place fast Walsh-Hadamard transform. O(d log d), no matrix materialized.
+
+    x shape: [..., d] where d must be a power of 2.
+    Returns the WHT of x (unnormalized — caller divides by sqrt(d)).
+    """
+    d = x.shape[-1]
+    h = 1
+    while h < d:
+        # Butterfly: for each pair of blocks of size h, compute sum and difference
+        x = x.reshape(*x.shape[:-1], -1, 2, h)
+        a = x[..., 0, :]
+        b = x[..., 1, :]
+        x = torch.stack([a + b, a - b], dim=-2)
+        x = x.reshape(*x.shape[:-3], -1)
+        h *= 2
+    return x
+
 
 class RotationCache:
     _cache: dict = {}
@@ -127,19 +146,12 @@ class RotationCache:
             rng = np.random.default_rng(seed)
             d_pad = 1 << (d - 1).bit_length()
             signs = torch.tensor(rng.choice([-1.0, 1.0], size=d_pad), dtype=torch.float32)
-            H = cls._hadamard(d_pad)
-            cls._cache[key] = {"d": d, "d_padded": d_pad, "signs": signs, "H": H}
+            cls._cache[key] = {"d": d, "d_padded": d_pad, "signs": signs}
         e = cls._cache[key]
         if device != torch.device("cpu"):
             return {"d": e["d"], "d_padded": e["d_padded"],
-                    "signs": e["signs"].to(device), "H": e["H"].to(device)}
+                    "signs": e["signs"].to(device)}
         return e
-
-    @staticmethod
-    def _hadamard(n):
-        if n == 1: return torch.tensor([[1.0]])
-        h = RotationCache._hadamard(n // 2)
-        return torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
 
 
 # ---------------------------------------------------------------------------
@@ -147,16 +159,16 @@ class RotationCache:
 # ---------------------------------------------------------------------------
 
 def tq_rotate(x, rot):
-    d, dp, signs, H = rot["d"], rot["d_padded"], rot["signs"], rot["H"]
+    d, dp, signs = rot["d"], rot["d_padded"], rot["signs"]
     if x.shape[-1] < dp:
         x = torch.nn.functional.pad(x, (0, dp - x.shape[-1]))
-    return ((x * signs) @ H.T / (dp ** 0.5))[..., :d]
+    return (_fast_wht(x * signs) / (dp ** 0.5))[..., :d]
 
 def tq_rotate_inv(y, rot):
-    d, dp, signs, H = rot["d"], rot["d_padded"], rot["signs"], rot["H"]
+    d, dp, signs = rot["d"], rot["d_padded"], rot["signs"]
     if y.shape[-1] < dp:
         y = torch.nn.functional.pad(y, (0, dp - y.shape[-1]))
-    return ((y @ H.T / (dp ** 0.5)) * signs)[..., :d]
+    return (_fast_wht(y) / (dp ** 0.5) * signs)[..., :d]
 
 def tq_quantize_mse(x, cb, rot):
     norms = torch.linalg.norm(x, dim=-1, keepdim=True)
@@ -321,3 +333,195 @@ class TQGatedAttnKVCache:
         correction = correction.reshape(b, nh, q_len, kv_len)
 
         return scores_mse + correction
+
+
+# ---------------------------------------------------------------------------
+# TQQuantizedCache — compressed KV storage with corrected attention
+# ---------------------------------------------------------------------------
+
+class TQQuantizedCache:
+    """Drop-in compressed KV cache for Qwen3.5-9B GatedAttn layers.
+
+    Stores KV cache in compressed form (uint8 MSE indices + int8 QJL bits +
+    float32 norms) instead of full float16/bfloat16 tensors. Provides the
+    corrected attention interface: compute_attention returns unbiased
+    softmax(Q @ K^T) @ V using QJL correction.
+
+    For DeltaNet layers (non-compressible), stores K/V in original precision.
+
+    Memory savings at bit_width=4, head_dim=256:
+      - Original: 2 bytes/element (bfloat16) = 512 bytes/token/head for K+V
+      - Compressed K: 1 byte (MSE) + 1 byte (QJL) + 8 bytes (norms) per token
+      - Compressed V: 1 byte (MSE) + 4 bytes (norm) per token
+      - Total compressed: ~270 bytes/token/head → ~1.9x reduction
+    """
+
+    def __init__(self, num_layers=32, interval=4,
+                 kv_head_dim=256, num_kv_heads=4,
+                 bit_width=4, seed=42, device=torch.device("cpu")):
+        self.num_layers = num_layers
+        self.ga_indices = {i for i in range(num_layers) if (i + 1) % interval == 0}
+        self.kv_head_dim = kv_head_dim
+        self.num_kv_heads = num_kv_heads
+        self.device = device
+
+        # K: (b-1)-bit MSE + 1-bit QJL
+        self.k_cb = CodebookRegistry.get(kv_head_dim, bit_width - 1, device)
+        self.k_rot = RotationCache.get(kv_head_dim, seed, device)
+        self.k_qjl = QJLProjection(kv_head_dim, seed=seed + 50, device=device)
+
+        # V: b-bit MSE only
+        self.v_cb = CodebookRegistry.get(kv_head_dim, bit_width, device)
+        self.v_rot = RotationCache.get(kv_head_dim, seed + 100, device)
+
+        # Per-layer storage: compressed dicts for GA layers, raw tensors for others
+        self._cache = [None] * num_layers
+        self._seq_lens = [0] * num_layers
+
+    def is_compressible(self, layer_idx):
+        return layer_idx in self.ga_indices
+
+    def update(self, K, V, layer_idx):
+        """Store K/V for a layer. Compresses GatedAttn layers, stores raw otherwise.
+
+        K, V shape: [batch, num_heads, seq_len, head_dim]
+        """
+        if not self.is_compressible(layer_idx):
+            # DeltaNet or non-compressible: store raw
+            if self._cache[layer_idx] is None:
+                self._cache[layer_idx] = (K, V)
+            else:
+                old_k, old_v = self._cache[layer_idx]
+                self._cache[layer_idx] = (
+                    torch.cat([old_k, K], dim=2),
+                    torch.cat([old_v, V], dim=2),
+                )
+            self._seq_lens[layer_idx] = self._cache[layer_idx][0].shape[2]
+            return
+
+        # Compress for GatedAttn layers
+        b, nh, sl, hd = K.shape
+        Kf = K.reshape(b * nh * sl, hd)
+        Vf = V.reshape(b * nh * sl, hd)
+
+        k_mse, k_qjl, k_rn, k_n = tq_quantize_prod(Kf, self.k_cb, self.k_rot, self.k_qjl)
+        v_idx, v_n = tq_quantize_mse(Vf, self.v_cb, self.v_rot)
+
+        new_entry = {
+            "k_mse": k_mse, "k_qjl": k_qjl, "k_rn": k_rn, "k_n": k_n,
+            "v_idx": v_idx, "v_n": v_n,
+            "batch": b, "num_heads": nh, "head_dim": hd,
+        }
+
+        if self._cache[layer_idx] is None:
+            self._cache[layer_idx] = new_entry
+            self._seq_lens[layer_idx] = sl
+        else:
+            old = self._cache[layer_idx]
+            self._cache[layer_idx] = {
+                "k_mse": torch.cat([old["k_mse"], new_entry["k_mse"]], dim=0),
+                "k_qjl": torch.cat([old["k_qjl"], new_entry["k_qjl"]], dim=0),
+                "k_rn": torch.cat([old["k_rn"], new_entry["k_rn"]], dim=0),
+                "k_n": torch.cat([old["k_n"], new_entry["k_n"]], dim=0),
+                "v_idx": torch.cat([old["v_idx"], new_entry["v_idx"]], dim=0),
+                "v_n": torch.cat([old["v_n"], new_entry["v_n"]], dim=0),
+                "batch": b, "num_heads": nh, "head_dim": hd,
+            }
+            self._seq_lens[layer_idx] += sl
+
+    def get_seq_length(self, layer_idx=0):
+        return self._seq_lens[layer_idx]
+
+    def compute_attention(self, Q, layer_idx):
+        """Compute attention output: softmax(Q @ K^T / sqrt(d)) @ V.
+
+        For compressed layers, uses QJL-corrected attention scores.
+        For raw layers, uses standard attention.
+
+        Q shape: [batch, num_heads, q_len, head_dim]
+        Returns: [batch, num_heads, q_len, head_dim]
+        """
+        entry = self._cache[layer_idx]
+        if entry is None:
+            raise ValueError(f"No cache for layer {layer_idx}")
+
+        if not self.is_compressible(layer_idx):
+            K, V = entry
+            scores = Q @ K.transpose(-2, -1) / (Q.shape[-1] ** 0.5)
+            attn = torch.softmax(scores, dim=-1)
+            return attn @ V
+
+        b = entry["batch"]
+        nh = entry["num_heads"]
+        hd = entry["head_dim"]
+        kv_len = self._seq_lens[layer_idx]
+        q_len = Q.shape[2]
+        shape = (b, nh, kv_len, hd)
+
+        # Stage 1: MSE-reconstructed K for biased scores
+        K_mse = tq_dequantize_mse(
+            entry["k_mse"], entry["k_n"], self.k_cb, self.k_rot
+        ).reshape(shape)
+        scores_mse = Q @ K_mse.transpose(-2, -1)
+
+        # Stage 2: QJL bias correction
+        Q_flat = Q.reshape(b * nh * q_len, hd)
+        Q_qjl = self.k_qjl.quantize(Q_flat).reshape(b * nh, q_len, hd)
+        k_qjl = entry["k_qjl"].reshape(b * nh, kv_len, hd)
+
+        correction = Q_qjl.float() @ k_qjl.float().transpose(-2, -1)
+        correction = correction * (math.pi / (2 * hd))
+        correction = correction * entry["k_rn"].reshape(b * nh, 1, kv_len)
+        correction = correction * entry["k_n"].reshape(b * nh, 1, kv_len)
+        correction = correction.reshape(b, nh, q_len, kv_len)
+
+        scores = (scores_mse + correction) / (hd ** 0.5)
+        attn = torch.softmax(scores, dim=-1)
+
+        # Decompress V and apply attention weights
+        V_decompressed = tq_dequantize_mse(
+            entry["v_idx"], entry["v_n"], self.v_cb, self.v_rot
+        ).reshape(shape)
+
+        return attn @ V_decompressed
+
+    def clear(self):
+        self._cache = [None] * self.num_layers
+        self._seq_lens = [0] * self.num_layers
+
+
+# ---------------------------------------------------------------------------
+# Straight-through estimator for differentiable quantization
+# ---------------------------------------------------------------------------
+
+class _STEQuantize(torch.autograd.Function):
+    """Straight-through estimator: forward does hard quantization,
+    backward passes gradients through as if quantization were identity."""
+
+    @staticmethod
+    def forward(ctx, y, boundaries, centroids):
+        indices = torch.searchsorted(boundaries[1:-1].contiguous(), y.contiguous())
+        return centroids[indices]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None
+
+
+def tq_quantize_mse_ste(x, cb, rot):
+    """Differentiable MSE quantization using straight-through estimator.
+
+    Forward: identical to tq_quantize_mse/tq_dequantize_mse (hard quantization).
+    Backward: gradients pass through the quantization as if it were identity.
+
+    Returns the reconstructed tensor (not indices), preserving the gradient graph.
+    """
+    norms = torch.linalg.norm(x, dim=-1, keepdim=True)
+    x_unit = x / (norms + 1e-12)
+    y = tq_rotate(x_unit, rot)
+    y = y.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+
+    # STE: forward quantizes, backward is identity
+    y_hat = _STEQuantize.apply(y, cb.boundaries, cb.centroids)
+
+    return tq_rotate_inv(y_hat, rot) * norms
