@@ -54,7 +54,9 @@ Both backends implement the same three-method interface: `is_compressible(layer_
 
 ## What turboquant-core does NOT implement
 
-### 1. K decompression for attention score computation
+> **Status update:** All four items below have been implemented. See git history.
+
+### 1. K decompression for attention score computation ✅ IMPLEMENTED
 
 The `decompress_v` method exists but there is no `decompress_k` method. This is the most significant gap. The reason TQ_prod exists is to provide unbiased estimation of softmax(Q @ K^T), but the current code only stores the compressed K representation — it doesn't provide a method to compute the corrected Q @ K_quantized^T inner product using the QJL residual.
 
@@ -79,7 +81,7 @@ def compute_attention_scores(self, Q, compressed_K):
 
 This is the core of TurboQuant's contribution and it's not wired up yet. The eval harness's current local patch adapter doesn't need this because it quantizes K/V at the projection output and lets the standard attention kernel handle the (now-quantized) K/V directly. But a true TQ backend would intercept the attention score computation itself.
 
-### 2. Integration with Qwen3_5DynamicCache
+### 2. Integration with Qwen3_5DynamicCache ✅ IMPLEMENTED
 
 The backends operate on raw K/V tensors but don't hook into the model's actual cache object. To use this in the eval harness, you need to either:
 
@@ -89,14 +91,14 @@ The backends operate on raw K/V tensors but don't hook into the model's actual c
 
 For the eval harness, path (a) is sufficient and is what the reviewer should wire first.
 
-### 3. Self-contained codebook computation
+### 3. Self-contained codebook computation ✅ IMPLEMENTED
 
 As noted above, `CodebookRegistry` imports from an external `turboquant` module for `get_codebook(d, b)`. If this dependency is missing, the library won't initialize. The reviewer should either:
 
 - Vendor the reference implementation's `get_codebook` function (it's a standard Lloyd-Max iteration on the Gaussian distribution — ~50 lines of scipy)
 - Or replace the import with a hardcoded table of known-good centroids for the dimensions actually used (128 for Qwen3-8B, 256 for Qwen3.5-9B)
 
-### 4. Gradient support
+### 4. Gradient support ✅ IMPLEMENTED
 
 All operations use `torch.no_grad()` semantics or detached tensors. The quantization functions are not differentiable. This is correct for inference-time KV cache compression but means you cannot backpropagate through the TQ operations during training. For the eval harness this is fine — you're measuring inference quality, not training.
 
@@ -214,13 +216,13 @@ The local patch vs real TQ comparison is the most interesting — it tells you w
 
 ### Known limitations to document
 
-9. **The `get_codebook` external dependency.** As described above, this needs to be resolved before the library is self-contained.
+9. ~~**The `get_codebook` external dependency.**~~ ✅ RESOLVED — replaced with self-contained `_lloyd_max_gaussian()` solver using scipy.
 
-10. **Dense Hadamard matrix at d=256.** Works for eval, would need fast WHT for production. Not a blocker.
+10. ~~**Dense Hadamard matrix at d=256.**~~ ✅ RESOLVED — replaced with fast Walsh-Hadamard transform (O(d log d), no matrix materialized).
 
-11. **No K decompression with QJL correction.** The adapter workaround (MSE-only K dequantization) is conservative. Document this in the eval results: "K reconstruction uses MSE only; full TQ_prod with QJL would improve K fidelity."
+11. ~~**No K decompression with QJL correction.**~~ ✅ RESOLVED — `compute_attention_scores()` implements full QJL-corrected Q@K^T.
 
-12. **bit_width parameter semantics.** When `bit_width=4` is passed to the backend, K gets a (4-1)=3 bit codebook and V gets a 4-bit codebook. The effective bits per value are 4 for K (3 MSE + 1 QJL) and 4 for V (4 MSE). This is correct but may be confusing — the same `bit_width` parameter produces different codebook sizes for K and V.
+12. **bit_width parameter semantics.** When `bit_width=4` is passed to the backend, K gets a (4-1)=3 bit codebook and V gets a 4-bit codebook. The effective bits per value are 4 for K (3 MSE + 1 QJL) and 4 for V (4 MSE). This is correct but may be confusing — the same `bit_width` parameter produces different codebook sizes for K and V. Documented in `docs/adapter-interface.md`.
 
 ---
 
@@ -229,16 +231,20 @@ The local patch vs real TQ comparison is the most interesting — it tells you w
 ```
 turboquant-core/
 ├── src/turboquant_core/
-│   ├── core.py          # TQ algorithms: codebooks, rotation, MSE, QJL, prod
+│   ├── __init__.py      # Public API exports
+│   ├── core.py          # TQ algorithms: codebooks, rotation, MSE, QJL, prod,
+│   │                    # TQQuantizedCache, STE gradient support
 │   └── backends/
-│       └── qwen.py      # Qwen35KVBackend (hybrid), Qwen3DenseKVBackend (dense)
+│       ├── qwen.py      # Qwen35KVBackend (hybrid), Qwen3DenseKVBackend (dense)
+│       └── qwen_hook.py # patch_qwen35_with_tq() model hook-in
 ├── tests/
-│   └── test_core.py     # Pure-math tests (no GPU required)
+│   └── test_core.py     # 35 tests: algorithms, backends, paper verification
 ├── configs/models/
 │   ├── qwen35_9b.yaml   # Probe-verified dims for Qwen3.5-9B
 │   └── qwen3_8b.yaml    # Dims for Qwen3-8B
 ├── docs/
-│   └── adapter-interface.md  # Contract for eval harness integration
+│   ├── adapter-interface.md  # Contract for eval harness integration
+│   └── HANDOFF.md       # This file
 ├── pyproject.toml       # pip install -e .
 ├── README.md
 ├── LICENSE              # Apache 2.0
