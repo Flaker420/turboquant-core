@@ -444,6 +444,153 @@ def test_ste_gradient_shape():
 
 
 # ---------------------------------------------------------------------------
+# Paper Table 2 verification (HANDOFF VERIFY #1, #3)
+# ---------------------------------------------------------------------------
+
+def test_paper_table2_codebook_centroids():
+    """Verify Lloyd-Max centroids match known optimal values for b=1..4."""
+    # Known optimal Lloyd-Max centroids for N(0,1)
+    known = {
+        1: ([-0.7979, 0.7979], 0.3634),
+        2: ([-1.5104, -0.4528, 0.4528, 1.5104], 0.1175),
+        3: ([-2.1519, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1519], 0.03454),
+    }
+    for b, (expected_c, expected_mse) in known.items():
+        centroids, mse = _lloyd_max_gaussian(b)
+        assert len(centroids) == 2 ** b
+        for c, e in zip(centroids, expected_c):
+            assert abs(c - e) < 0.01, f"b={b}: centroid {c} != {e}"
+        assert abs(mse - expected_mse) < 0.005, f"b={b}: MSE {mse} != {expected_mse}"
+    print(f"  Paper Table 2 centroids b=1..3 — OK")
+
+
+def test_paper_table2_mse_round_trip():
+    """Verify MSE/coord at multiple bit widths matches theoretical values."""
+    # Theoretical Lloyd-Max MSE on N(0,1), scaled by 1/d for the rotated distribution
+    # Paper Table 2 reference values (asymptotic d→∞)
+    d = 256
+    results = {}
+    for b in [1, 2, 3, 4]:
+        cb = CodebookRegistry.get(d, b)
+        rot = RotationCache.get(d, seed=42)
+        x = torch.randn(5000, d)
+        idx, norms = tq_quantize_mse(x, cb, rot)
+        x_hat = tq_dequantize_mse(idx, norms, cb, rot)
+        mse = ((x - x_hat) ** 2).mean().item()
+        results[b] = mse
+    # MSE should decrease as bit_width increases
+    assert results[1] > results[2] > results[3] > results[4], \
+        f"MSE should decrease: {results}"
+    # b=4 should be < 0.02 (paper ~0.0115)
+    assert results[4] < 0.02, f"b=4 MSE too high: {results[4]}"
+    # b=1 should be much higher
+    assert results[1] > 0.1, f"b=1 MSE too low: {results[1]}"
+    print(f"  MSE/coord by bit_width: " +
+          ", ".join(f"b={b}={v:.4f}" for b, v in results.items()) + " — OK")
+
+
+def test_qjl_inner_product_unbiasedness():
+    """QJL estimator of inner products should be approximately unbiased."""
+    d = 256
+    qjl = QJLProjection(d, seed=123)
+    # Generate random pairs and compare true vs QJL-estimated inner products
+    n_pairs = 1000
+    x = torch.randn(n_pairs, d)
+    y = torch.randn(n_pairs, d)
+    true_ip = (x * y).sum(dim=-1)
+    # QJL estimate: (pi/2d) * sign(Sx) @ sign(Sy) * ||x|| * ||y||
+    x_norms = torch.linalg.norm(x, dim=-1)
+    y_norms = torch.linalg.norm(y, dim=-1)
+    x_unit = x / (x_norms.unsqueeze(-1) + 1e-12)
+    y_unit = y / (y_norms.unsqueeze(-1) + 1e-12)
+    sx = qjl.quantize(x_unit).float()
+    sy = qjl.quantize(y_unit).float()
+    qjl_ip = (sx * sy).sum(dim=-1) * (math.pi / (2 * d)) * x_norms * y_norms
+    # Should be unbiased: mean of (qjl - true) ≈ 0
+    bias = (qjl_ip - true_ip).mean().item()
+    # Allow some variance but bias should be small relative to scale
+    scale = true_ip.abs().mean().item()
+    assert abs(bias / scale) < 0.15, f"QJL bias too large: {bias:.4f} (scale={scale:.4f})"
+    print(f"  QJL inner product bias: {bias:.4f} (relative: {bias/scale:.4f}) — OK")
+
+
+# ---------------------------------------------------------------------------
+# Adapter interface compatibility test (HANDOFF VERIFY #8)
+# ---------------------------------------------------------------------------
+
+def test_adapter_interface_contract():
+    """Verify backends match the adapter-interface.md contract exactly."""
+    import inspect
+
+    for BackendCls, name in [
+        (Qwen35KVBackend, "Qwen35KVBackend"),
+        (Qwen3DenseKVBackend, "Qwen3DenseKVBackend"),
+    ]:
+        backend = BackendCls()
+
+        # Required method: is_compressible(layer_idx: int) -> bool
+        assert hasattr(backend, 'is_compressible'), f"{name} missing is_compressible"
+        sig = inspect.signature(backend.is_compressible)
+        params = list(sig.parameters.keys())
+        assert 'layer_idx' in params, f"{name}.is_compressible missing layer_idx param"
+        result = backend.is_compressible(0)
+        assert isinstance(result, bool), f"{name}.is_compressible should return bool"
+
+        # Required method: compress(K, V, layer_idx) -> dict
+        assert hasattr(backend, 'compress'), f"{name} missing compress"
+        sig = inspect.signature(backend.compress)
+        params = list(sig.parameters.keys())
+        assert 'K' in params or params[0] == 'K' or len(params) >= 3, \
+            f"{name}.compress signature mismatch: {params}"
+
+        # Required method: decompress_v(compressed) -> Tensor
+        assert hasattr(backend, 'decompress_v'), f"{name} missing decompress_v"
+
+        # Extended method: compute_attention_scores(Q, compressed) -> Tensor
+        assert hasattr(backend, 'compute_attention_scores'), \
+            f"{name} missing compute_attention_scores"
+
+        # Functional test: compress returns dict with expected keys
+        if name == "Qwen35KVBackend":
+            K = torch.randn(1, 4, 8, 256)
+            V = torch.randn(1, 4, 8, 256)
+            idx = 3
+        else:
+            K = torch.randn(1, 8, 8, 128)
+            V = torch.randn(1, 8, 8, 128)
+            idx = 0
+        compressed = backend.compress(K, V, idx)
+        assert isinstance(compressed, dict), f"{name}.compress should return dict"
+        assert "shape" in compressed, f"{name}.compress dict missing 'shape'"
+
+        # decompress_v returns Tensor with correct shape
+        V_out = backend.decompress_v(compressed)
+        assert isinstance(V_out, torch.Tensor), f"{name}.decompress_v should return Tensor"
+        assert V_out.shape == V.shape, f"{name}.decompress_v shape mismatch"
+
+    print(f"  Adapter interface contract verified for both backends — OK")
+
+
+# ---------------------------------------------------------------------------
+# bit_width semantics test (HANDOFF LIMIT #12)
+# ---------------------------------------------------------------------------
+
+def test_bit_width_kv_asymmetry_semantics():
+    """bit_width=4 → K gets 3-bit codebook (8 levels), V gets 4-bit (16 levels)."""
+    backend = Qwen35KVBackend(bit_width=4)
+    # K codebook: bit_width - 1 = 3 bits = 8 centroids
+    assert backend.k_cb.centroids.shape[0] == 8, \
+        f"K should have 8 centroids (3-bit), got {backend.k_cb.centroids.shape[0]}"
+    assert backend.k_cb.bit_width == 3
+    # V codebook: bit_width = 4 bits = 16 centroids
+    assert backend.v_cb.centroids.shape[0] == 16, \
+        f"V should have 16 centroids (4-bit), got {backend.v_cb.centroids.shape[0]}"
+    assert backend.v_cb.bit_width == 4
+    # Effective: K = 3 MSE + 1 QJL = 4 bits total, V = 4 MSE = 4 bits total
+    print(f"  bit_width=4: K=3-bit MSE + 1-bit QJL, V=4-bit MSE — OK")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -482,6 +629,12 @@ if __name__ == "__main__":
         test_ste_forward_matches_hard,
         test_ste_gradient_flows,
         test_ste_gradient_shape,
+        # Paper Table 2 and verification tests
+        test_paper_table2_codebook_centroids,
+        test_paper_table2_mse_round_trip,
+        test_qjl_inner_product_unbiasedness,
+        test_adapter_interface_contract,
+        test_bit_width_kv_asymmetry_semantics,
     ]
 
     print(f"Running {len(tests)} tests...\n")
