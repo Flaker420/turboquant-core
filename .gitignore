@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# ML artifacts
+outputs/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+*.gguf
+wandb/
+
+# Data
+data/
+*.arrow
+*.parquet
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HuggingFace cache
+hf_cache/
