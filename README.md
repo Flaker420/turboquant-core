@@ -11,6 +11,7 @@ Pure Python/PyTorch implementation of TurboQuant (ICLR 2026): Lloyd-Max codebook
 - **TQ_MSE** — MSE-optimal quantization via random rotation + Lloyd-Max scalar quantization
 - **TQ_prod** — MSE + 1-bit QJL residual for unbiased inner product estimation
 - **QJL** — Quantized Johnson-Lindenstrauss projection (sign-bit quantization)
+- **STE** — Straight-through estimator for differentiable quantization
 
 ## Model backends
 
@@ -19,6 +20,8 @@ Pure Python/PyTorch implementation of TurboQuant (ICLR 2026): Lloyd-Max codebook
 | `Qwen35KVBackend` | Qwen3.5-9B | 8 GatedAttn (of 32) | K→TQ_prod, V→TQ_MSE |
 | `Qwen3DenseKVBackend` | Qwen3-8B | All 36 | K→TQ_prod, V→TQ_MSE |
 
+### Compress / decompress
+
 ```python
 from turboquant_core.backends.qwen import Qwen35KVBackend
 
@@ -26,11 +29,48 @@ backend = Qwen35KVBackend(bit_width=4, device="cuda")
 if backend.is_compressible(layer_idx=3):
     compressed = backend.compress(K, V, layer_idx=3)
     V_restored = backend.decompress_v(compressed)
+    attn_scores = backend.compute_attention_scores(Q, compressed)
+```
+
+### Model hook-in (drop-in KV cache replacement)
+
+```python
+from transformers import AutoModelForCausalLM
+from turboquant_core import patch_qwen35_with_tq, patch_qwen3_with_tq
+
+# Qwen3.5-9B (hybrid: 8 GatedAttn layers compressed, DeltaNet unchanged)
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-9B", ...)
+cache = patch_qwen35_with_tq(model, bit_width=4)
+# model.generate() now uses compressed KV cache
+cache.clear()  # call between generations
+
+# Qwen3-8B (dense: all 36 layers compressed)
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", ...)
+cache = patch_qwen3_with_tq(model, bit_width=4)
+```
+
+## Install
+
+```bash
+pip install -e .
+# With dev tools: pip install -e ".[dev]"
+```
+
+## Tests
+
+```bash
+pytest tests/ -v
+```
+
+## Benchmarks
+
+```bash
+python benchmarks/benchmark_kv_cache.py
 ```
 
 ## Integration with turboquant-workflow-eval
 
-This library provides the real TQ backend for the adapter interface in [turboquant-workflow-eval](https://github.com/Flaker420/turboquant-workflow-eval).
+This library provides the real TQ backend for the adapter interface in [turboquant-workflow-eval](https://github.com/Flaker420/turboquant-workflow-eval). See `docs/HANDOFF.md` for wiring instructions.
 
 ## Reference
 
