@@ -8,12 +8,14 @@ Key probe findings for TQ:
   - KV head_dim is 256 (not 128), num_kv_heads is 4 (not 8)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from pathlib import Path
+from scipy.stats import norm
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +31,63 @@ class TQCodebook:
     mse_per_coord: float
 
 
+def _lloyd_max_gaussian(b: int, max_iter: int = 200, tol: float = 1e-12):
+    """Compute Lloyd-Max optimal quantizer for the standard normal distribution.
+
+    Returns (centroids, mse_per_coord) where centroids is a sorted numpy array
+    of 2^b reproduction levels minimizing E[(X - Q(X))^2] for X ~ N(0,1).
+    """
+    n_levels = 1 << b
+    # Initialize centroids at evenly-spaced quantiles
+    quantiles = np.linspace(0, 1, n_levels + 2)[1:-1]
+    centroids = norm.ppf(quantiles)
+
+    for _ in range(max_iter):
+        # Boundaries = midpoints between adjacent centroids
+        boundaries = np.concatenate([[-np.inf],
+                                     (centroids[:-1] + centroids[1:]) / 2.0,
+                                     [np.inf]])
+        # Update centroids as conditional expectations E[X | b_i < X < b_{i+1}]
+        new_centroids = np.empty(n_levels)
+        for i in range(n_levels):
+            lo, hi = boundaries[i], boundaries[i + 1]
+            # E[X | lo < X < hi] = (phi(lo) - phi(hi)) / (Phi(hi) - Phi(lo))
+            p = norm.cdf(hi) - norm.cdf(lo)
+            if p < 1e-15:
+                new_centroids[i] = (lo + hi) / 2.0
+            else:
+                new_centroids[i] = (norm.pdf(lo) - norm.pdf(hi)) / p
+
+        if np.max(np.abs(new_centroids - centroids)) < tol:
+            centroids = new_centroids
+            break
+        centroids = new_centroids
+
+    # Compute MSE per coordinate: E[(X - Q(X))^2]
+    boundaries = np.concatenate([[-np.inf],
+                                 (centroids[:-1] + centroids[1:]) / 2.0,
+                                 [np.inf]])
+    mse = 0.0
+    for i in range(n_levels):
+        lo, hi = boundaries[i], boundaries[i + 1]
+        p = norm.cdf(hi) - norm.cdf(lo)
+        if p < 1e-15:
+            continue
+        c = centroids[i]
+        # E[X|lo<X<hi] * P = phi(lo) - phi(hi), but x*phi(x)->0 as x->±inf
+        phi_lo = norm.pdf(lo) if np.isfinite(lo) else 0.0
+        phi_hi = norm.pdf(hi) if np.isfinite(hi) else 0.0
+        ex_p = phi_lo - phi_hi
+        # E[X^2|lo<X<hi]*P = P + lo*phi(lo) - hi*phi(hi)
+        lo_phi_lo = lo * phi_lo if np.isfinite(lo) else 0.0
+        hi_phi_hi = hi * phi_hi if np.isfinite(hi) else 0.0
+        ex2_p = p + lo_phi_lo - hi_phi_hi
+        mse += ex2_p - 2 * c * ex_p + c * c * p
+
+    centroids.sort()
+    return centroids, float(mse)
+
+
 class CodebookRegistry:
     _cache: dict = {}
 
@@ -36,19 +95,16 @@ class CodebookRegistry:
     def get(cls, d: int, b: int, device=torch.device("cpu")) -> TQCodebook:
         key = (d, b)
         if key not in cls._cache:
-            sys_path_bak = __import__("sys").path[:]
-            __import__("sys").path.insert(0, str(Path(__file__).parent.parent.parent / "turboquant"))
-            from turboquant import get_codebook
-            __import__("sys").path[:] = sys_path_bak
-
-            cb = get_codebook(d, b)
-            centroids = torch.tensor(cb.centroids, dtype=torch.float32)
+            raw_centroids, mse_per_coord = _lloyd_max_gaussian(b)
+            # Scale for the rotated unit-vector distribution: each coordinate ~ N(0, 1/d)
+            scale = 1.0 / (d ** 0.5)
+            centroids = torch.tensor(raw_centroids * scale, dtype=torch.float32)
             boundaries = torch.empty(len(centroids) + 1)
             boundaries[0] = -1.0
             boundaries[-1] = 1.0
             for i in range(len(centroids) - 1):
                 boundaries[i + 1] = (centroids[i] + centroids[i + 1]) / 2.0
-            cls._cache[key] = TQCodebook(d, b, centroids, boundaries, cb.mse_cost_per_coord)
+            cls._cache[key] = TQCodebook(d, b, centroids, boundaries, mse_per_coord / d)
 
         cb = cls._cache[key]
         if device != torch.device("cpu"):
@@ -234,3 +290,34 @@ class TQGatedAttnKVCache:
         s = compressed["shape"]
         Vf = tq_dequantize_mse(compressed["v_idx"], compressed["v_n"], self.v_cb, self.v_rot)
         return Vf.reshape(s)
+
+    def compute_attention_scores(self, Q, compressed):
+        """Compute unbiased Q @ K^T from fresh Q and compressed K using QJL correction.
+
+        Q shape: [batch, num_heads, q_len, head_dim]
+        Returns: [batch, num_heads, q_len, kv_len]
+        """
+        b, nh, kv_len, hd = compressed["shape"]
+        q_len = Q.shape[2]
+
+        # Stage 1: Q @ K_mse^T (biased, from MSE reconstruction)
+        K_mse = tq_dequantize_mse(
+            compressed["k_mse"], compressed["k_n"], self.k_cb, self.k_rot
+        ).reshape(compressed["shape"])
+        scores_mse = Q @ K_mse.transpose(-2, -1)
+
+        # Stage 2: QJL bias correction on the residual
+        # Reshape to [b*nh, seq, hd] for per-head batched matmul
+        Q_flat = Q.reshape(b * nh * q_len, hd)
+        Q_qjl = self.k_qjl.quantize(Q_flat).reshape(b * nh, q_len, hd)
+        k_qjl = compressed["k_qjl"].reshape(b * nh, kv_len, hd)
+
+        # [b*nh, q_len, hd] @ [b*nh, hd, kv_len] -> [b*nh, q_len, kv_len]
+        correction = Q_qjl.float() @ k_qjl.float().transpose(-2, -1)
+        correction = correction * (math.pi / (2 * hd))
+        # k_rn and k_n are [b*nh*kv_len] -> [b*nh, 1, kv_len] for broadcasting
+        correction = correction * compressed["k_rn"].reshape(b * nh, 1, kv_len)
+        correction = correction * compressed["k_n"].reshape(b * nh, 1, kv_len)
+        correction = correction.reshape(b, nh, q_len, kv_len)
+
+        return scores_mse + correction
