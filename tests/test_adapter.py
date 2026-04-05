@@ -164,3 +164,88 @@ class TestTurboQuantAdapter:
         adapter = TurboQuantAdapter()
         adapter.cleanup(None)  # should not raise
         assert adapter._cache is None
+
+    # -- can_revert / revert ---------------------------------------------------
+
+    def test_can_revert_false_before_prepare(self):
+        adapter = TurboQuantAdapter()
+        assert adapter.can_revert() is False
+
+    def test_can_revert_true_after_prepare(self):
+        adapter = TurboQuantAdapter()
+        model = _make_qwen35_mock()
+        adapter.prepare_model(model, None, {"name": "Qwen/Qwen3.5-9B"}, {"settings": {}})
+        assert adapter.can_revert() is True
+
+    def test_revert_restores_model(self):
+        adapter = TurboQuantAdapter()
+        model = _make_qwen35_mock()
+
+        adapter.prepare_model(model, None, {"name": "Qwen/Qwen3.5-9B"}, {"settings": {}})
+        assert adapter.can_revert() is True
+        # Layer 3 is compressible and should be patched
+        assert hasattr(model.model.layers[3].self_attn.forward, '__wrapped__')
+
+        result = adapter.revert(model)
+        assert result is True
+        assert adapter.can_revert() is False
+        assert adapter._cache is None
+        # Forward should be restored (no __wrapped__ = original bound method)
+        assert not hasattr(model.model.layers[3].self_attn.forward, '__wrapped__')
+
+    def test_revert_without_prepare_returns_false(self):
+        adapter = TurboQuantAdapter()
+        model = _make_qwen35_mock()
+        assert adapter.revert(model) is False
+
+    def test_double_revert_returns_false(self):
+        adapter = TurboQuantAdapter()
+        model = _make_qwen35_mock()
+        adapter.prepare_model(model, None, {"name": "Qwen/Qwen3.5-9B"}, {"settings": {}})
+        assert adapter.revert(model) is True
+        assert adapter.revert(model) is False
+
+    # -- get_state -------------------------------------------------------------
+
+    def test_get_state_before_prepare(self):
+        adapter = TurboQuantAdapter()
+        state = adapter.get_state()
+        assert state == {
+            "adapter": "turboquant",
+            "variant": None,
+            "bit_width": None,
+            "seed": None,
+            "patched": False,
+        }
+
+    def test_get_state_after_prepare(self):
+        adapter = TurboQuantAdapter()
+        model = _make_qwen3_mock()
+        adapter.prepare_model(
+            model, None,
+            {"name": "Qwen/Qwen3-8B"},
+            {"settings": {"bit_width": 2, "seed": 99}},
+        )
+        state = adapter.get_state()
+        assert state == {
+            "adapter": "turboquant",
+            "variant": "qwen3",
+            "bit_width": 2,
+            "seed": 99,
+            "patched": True,
+        }
+
+    def test_get_state_after_revert(self):
+        adapter = TurboQuantAdapter()
+        model = _make_qwen3_mock()
+        adapter.prepare_model(model, None, {"name": "Qwen/Qwen3-8B"}, {"settings": {}})
+        adapter.revert(model)
+        state = adapter.get_state()
+        assert state["patched"] is False
+        assert state["variant"] == "qwen3"  # variant preserved
+
+    # -- update_params ---------------------------------------------------------
+
+    def test_update_params_returns_false(self):
+        adapter = TurboQuantAdapter()
+        assert adapter.update_params() is False

@@ -7,6 +7,7 @@ import pytest
 from turboquant_core.backends.qwen_hook import (
     patch_qwen35_with_tq,
     patch_qwen3_with_tq,
+    unpatch_model,
     _get_model_layers,
     _get_attention_module,
     _apply_rotary_pos_emb,
@@ -306,6 +307,54 @@ class TestGQAWithCache:
         output, _, _ = layer.self_attn(hidden_states)
         assert output.shape == (bsz, seq_len, hidden_size)
         assert not torch.isnan(output).any()
+
+
+# ---------------------------------------------------------------------------
+# Tests: unpatch_model
+# ---------------------------------------------------------------------------
+
+class TestUnpatchModel:
+    def test_unpatch_qwen35_restores_forward(self):
+        model = _make_qwen35_mock()
+        cache = patch_qwen35_with_tq(model, bit_width=4)
+
+        # Verify compressible layers have the marker
+        for i, layer in enumerate(model.model.layers):
+            if cache.is_compressible(i):
+                assert hasattr(layer.self_attn, '_tq_original_forward')
+
+        count = unpatch_model(model)
+        assert count == 8  # 8 GatedAttn layers
+
+        # Verify all layers restored: no markers, no __wrapped__ (patched fn)
+        for i, layer in enumerate(model.model.layers):
+            assert not hasattr(layer.self_attn, '_tq_original_forward')
+            assert not hasattr(layer.self_attn.forward, '__wrapped__'), \
+                f"Layer {i} should be unpatched"
+
+    def test_unpatch_qwen3_restores_all(self):
+        model = _make_qwen3_mock()
+        patch_qwen3_with_tq(model, bit_width=4)
+        count = unpatch_model(model)
+        assert count == 36
+
+        for layer in model.model.layers:
+            assert not hasattr(layer.self_attn, '_tq_original_forward')
+
+    def test_unpatch_unpatched_model_returns_zero(self):
+        model = _make_qwen35_mock()
+        assert unpatch_model(model) == 0
+
+    def test_unpatch_bad_model_returns_zero(self):
+        model = nn.Module()
+        model.encoder = nn.Linear(10, 10)
+        assert unpatch_model(model) == 0
+
+    def test_double_unpatch_is_safe(self):
+        model = _make_qwen3_mock()
+        patch_qwen3_with_tq(model, bit_width=4)
+        assert unpatch_model(model) == 36
+        assert unpatch_model(model) == 0  # second call is a no-op
 
 
 if __name__ == "__main__":

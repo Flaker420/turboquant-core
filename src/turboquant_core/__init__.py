@@ -15,7 +15,7 @@ from turboquant_core.core import (
     tq_rotate_inv,
 )
 from turboquant_core.backends.qwen import Qwen35KVBackend, Qwen3DenseKVBackend
-from turboquant_core.backends.qwen_hook import patch_qwen35_with_tq, patch_qwen3_with_tq
+from turboquant_core.backends.qwen_hook import patch_qwen35_with_tq, patch_qwen3_with_tq, unpatch_model
 from turboquant_core.adapters.workflow_eval import TurboQuantAdapter
 
 __all__ = [
@@ -37,5 +37,6 @@ __all__ = [
     "Qwen3DenseKVBackend",
     "patch_qwen35_with_tq",
     "patch_qwen3_with_tq",
+    "unpatch_model",
     "TurboQuantAdapter",
 ]
