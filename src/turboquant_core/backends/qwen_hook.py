@@ -36,7 +36,9 @@ from ..core import (
 )
 
 
-def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None):
+def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
+                         num_layers=32, full_attn_interval=4,
+                         kv_heads=4, head_dim=256):
     """Patch a Qwen3.5 model to use TurboQuant compressed KV cache.
 
     Args:
@@ -44,6 +46,10 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None):
         bit_width: Total bits per value (K gets b-1 MSE + 1 QJL, V gets b MSE).
         seed: Random seed for rotation and QJL matrices.
         device: Device for TQ buffers. Defaults to model's device.
+        num_layers: Number of transformer layers (default 32).
+        full_attn_interval: GatedAttn layer interval (default 4).
+        kv_heads: Number of KV heads (default 4).
+        head_dim: Head dimension (default 256).
 
     Returns:
         TQQuantizedCache instance. Call cache.clear() between generations.
@@ -52,8 +58,8 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None):
         device = next(model.parameters()).device
 
     cache = TQQuantizedCache(
-        num_layers=32, interval=4,
-        kv_head_dim=256, num_kv_heads=4,
+        num_layers=num_layers, interval=full_attn_interval,
+        kv_head_dim=head_dim, num_kv_heads=kv_heads,
         bit_width=bit_width, seed=seed, device=device,
     )
 
@@ -79,16 +85,20 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None):
     return cache
 
 
-def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None):
+def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None, *,
+                        num_layers=36, kv_heads=8, head_dim=128):
     """Patch a Qwen3-8B model to use TurboQuant compressed KV cache.
 
-    All 36 layers are dense attention and compressible.
+    All layers are dense attention and compressible.
 
     Args:
         model: A Qwen3 CausalLM model from transformers.
         bit_width: Total bits per value (K gets b-1 MSE + 1 QJL, V gets b MSE).
         seed: Random seed for rotation and QJL matrices.
         device: Device for TQ buffers. Defaults to model's device.
+        num_layers: Number of transformer layers (default 36).
+        kv_heads: Number of KV heads (default 8).
+        head_dim: Head dimension (default 128).
 
     Returns:
         TQQuantizedCache instance. Call cache.clear() between generations.
@@ -97,8 +107,8 @@ def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None):
         device = next(model.parameters()).device
 
     cache = TQQuantizedCache(
-        num_layers=36, interval=1,
-        kv_head_dim=128, num_kv_heads=8,
+        num_layers=num_layers, interval=1,
+        kv_head_dim=head_dim, num_kv_heads=kv_heads,
         bit_width=bit_width, seed=seed, device=device,
     )
 
