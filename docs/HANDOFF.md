@@ -14,7 +14,7 @@ This document covers what `turboquant-core` implements, how to wire it into the 
 
 ### Core algorithms (`src/turboquant_core/core.py`)
 
-- **CodebookRegistry** — Self-contained Lloyd-Max codebook solver using scipy. Precomputes and caches codebooks for (dimension, bit_width) pairs with O(log n) quantization via `torch.searchsorted`.
+- **CodebookRegistry** — Self-contained Lloyd-Max codebook solver using scipy. Precomputes and caches codebooks for (dimension, bit_width) pairs with O(log n) quantization via `torch.searchsorted`. Public API: `get()`, `precompute()`, `list_cached()`, `clear()`.
 - **RotationCache** — Fast Walsh-Hadamard rotation (O(d log d), no matrix materialized). Randomized with seeded sign vectors.
 - **tq_quantize_mse / tq_dequantize_mse** — TQ Algorithm 1: MSE-optimal quantization via random rotation + Lloyd-Max scalar quantization.
 - **QJLProjection** — Quantized Johnson-Lindenstrauss: 1-bit sign quantization of `S @ x` for unbiased inner product estimation.
@@ -32,10 +32,18 @@ This document covers what `turboquant-core` implements, how to wire it into the 
 
 Both backends implement: `is_compressible(layer_idx)`, `compress(K, V, layer_idx)`, `decompress_v(compressed)`, `compute_attention_scores(Q, compressed)`.
 
+**Configurable constructors**: Both accept keyword-only layout params (`num_layers`, `kv_heads`, `head_dim`, etc.) and algorithm strategy params (`key_strategy`, `value_strategy`) with defaults matching the standard model configs.
+
 ### Model hook-in (`src/turboquant_core/backends/qwen_hook.py`)
 
-- **`patch_qwen35_with_tq(model, bit_width=4)`** — Monkey-patches Qwen3.5-9B attention to use TQ compressed KV cache. Handles GQA expansion (24 Q heads / 4 KV heads).
-- **`patch_qwen3_with_tq(model, bit_width=4)`** — Same for Qwen3-8B (all 36 layers, 32 Q heads / 8 KV heads).
+- **`patch_qwen35_with_tq(model, bit_width=4)`** — Monkey-patches Qwen3.5-9B attention to use TQ compressed KV cache. Handles GQA expansion (24 Q heads / 4 KV heads). Accepts layout overrides.
+- **`patch_qwen3_with_tq(model, bit_width=4)`** — Same for Qwen3-8B (all 36 layers, 32 Q heads / 8 KV heads). Accepts layout overrides.
+- **`unpatch_model(model)`** — Restores original attention forward methods on all TQ-patched layers.
+
+### Adapter (`src/turboquant_core/adapters/workflow_eval.py`)
+
+- **`TurboQuantAdapter`** — Duck-types the eval harness's `CompressionAdapter` interface. Supports `prepare_model()`, `can_revert()`, `revert()`, `get_state()`, `update_params()`, `describe()`, `cleanup()`.
+- **`register_variant()`** — Register custom model variants for auto-detection.
 
 ---
 
@@ -48,9 +56,25 @@ pip install -e ../turboquant-core
 # Or: pip install git+https://github.com/Flaker420/turboquant-core.git
 ```
 
-### Step 2: Create the adapter
+### Step 2: Use the built-in adapter
 
-Create `src/qwen35_turboquant_workflow_study/adapters/turboquant_real.py`:
+The eval harness already supports `TurboQuantAdapter` via import path. No custom adapter file needed:
+
+```yaml
+adapter:
+  import_path: "turboquant_core.adapters.workflow_eval:TurboQuantAdapter"
+  settings:
+    bit_width: 4
+    seed: 42
+    key_strategy: "mse+qjl"    # optional, default
+    value_strategy: "mse"       # optional, default
+```
+
+The eval harness's `hasattr`-based delegation automatically picks up `can_revert()`, `revert()`, `get_state()`, and `update_params()` — no code changes needed on the eval side.
+
+### Step 3 (alternative): Direct backend adapter
+
+For reconstruction-quality experiments (compress → immediately decompress):
 
 ```python
 from turboquant_core.backends.qwen import Qwen35KVBackend
@@ -87,19 +111,6 @@ class TurboQuantRealAdapter:
 
 Note: this adapter dequantizes K using only the MSE component, not the full TQ_prod reconstruction with QJL correction. This makes the K reconstruction *worse* than what a real TQ_prod backend would achieve — eval results are a conservative lower bound.
 
-### Step 3: Add a policy config
-
-Create `configs/policies/tq_real_4bit.yaml`:
-
-```yaml
-policy:
-  name: "tq_real_4bit"
-  adapter_class: "adapters.turboquant_real.TurboQuantRealAdapter"
-  adapter_kwargs:
-    bit_width: 4
-  description: "Real TurboQuant: 3-bit MSE + 1-bit QJL on K, 4-bit MSE on V (GatedAttn only)"
-```
-
 ### Step 4: Run the comparison
 
 ```bash
@@ -132,9 +143,13 @@ make study \
 
 8. **Adapter interface compatibility.** The methods (`is_compressible`, `compress`, `decompress_v`, `compute_attention_scores`) match `docs/adapter-interface.md`.
 
+9. **Model revert.** Patch a model, call `can_revert()` (True), call `revert()`, verify original forward restored and `can_revert()` returns False.
+
+10. **Algorithm selection.** `Qwen35KVBackend(key_strategy="mse")` — K uses MSE-only, no QJL correction. Invalid strategies raise `ValueError`.
+
 ### Known design decisions
 
-9. **bit_width semantics.** When `bit_width=4`: K gets 3-bit MSE + 1-bit QJL, V gets 4-bit MSE. Same `bit_width` produces different codebook sizes for K and V. Documented in `docs/adapter-interface.md`.
+11. **bit_width semantics.** When `bit_width=4` and `key_strategy="mse+qjl"`: K gets 3-bit MSE + 1-bit QJL, V gets 4-bit MSE. Same `bit_width` produces different codebook sizes for K and V. When `key_strategy="mse"`: both K and V get 4-bit MSE. Documented in `docs/adapter-interface.md`.
 
 ---
 
@@ -143,15 +158,19 @@ make study \
 ```
 turboquant-core/
 ├── src/turboquant_core/
-│   ├── __init__.py      # Public API exports
+│   ├── __init__.py      # Public API exports (incl. unpatch_model, register_variant)
 │   ├── core.py          # TQ algorithms: codebooks, rotation, MSE, QJL, prod,
 │   │                    # TQQuantizedCache, STE gradient support
-│   └── backends/
-│       ├── qwen.py      # Qwen35KVBackend (hybrid), Qwen3DenseKVBackend (dense)
-│       └── qwen_hook.py # patch_qwen35_with_tq(), patch_qwen3_with_tq()
+│   ├── backends/
+│   │   ├── qwen.py      # Qwen35KVBackend (hybrid), Qwen3DenseKVBackend (dense)
+│   │   └── qwen_hook.py # patch/unpatch functions
+│   └── adapters/
+│       ├── __init__.py   # Re-exports TurboQuantAdapter
+│       └── workflow_eval.py  # TurboQuantAdapter, register_variant, _detect_variant
 ├── tests/
-│   ├── test_core.py     # 37 tests: algorithms, backends, paper verification
-│   └── test_hooks.py    # 21 tests: model hook-in, GQA, patched forward
+│   ├── test_core.py     # Core algorithm + backend tests (incl. strategy, registry)
+│   ├── test_hooks.py    # Model hook-in, GQA, patched forward, unpatch tests
+│   └── test_adapter.py  # Adapter, variant detection, revert, get_state tests
 ├── benchmarks/
 │   └── benchmark_kv_cache.py  # Compression ratio, MSE, throughput
 ├── configs/models/
