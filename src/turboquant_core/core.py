@@ -372,18 +372,28 @@ class TQQuantizedCache:
     def __init__(self, num_layers=32, interval=4,
                  kv_head_dim=256, num_kv_heads=4,
                  bit_width=4, seed=42, device=torch.device("cpu"),
-                 residual_window=0):
+                 residual_window=0, key_strategy="mse+qjl"):
         self.num_layers = num_layers
         self.ga_indices = {i for i in range(num_layers) if (i + 1) % interval == 0}
         self.kv_head_dim = kv_head_dim
         self.num_kv_heads = num_kv_heads
         self.device = device
         self.residual_window = residual_window
+        self.key_strategy = key_strategy
 
-        # K: (b-1)-bit MSE + 1-bit QJL
-        self.k_cb = CodebookRegistry.get(kv_head_dim, bit_width - 1, device)
+        if key_strategy == "mse+qjl":
+            # K: (b-1)-bit MSE + 1-bit QJL
+            self.k_cb = CodebookRegistry.get(kv_head_dim, bit_width - 1, device)
+            self.k_qjl = QJLProjection(kv_head_dim, seed=seed + 50, device=device)
+        elif key_strategy == "mse":
+            # K: b-bit MSE only (no QJL)
+            self.k_cb = CodebookRegistry.get(kv_head_dim, bit_width, device)
+            self.k_qjl = None
+        else:
+            raise ValueError(
+                f"Invalid key_strategy {key_strategy!r}. Must be 'mse' or 'mse+qjl'."
+            )
         self.k_rot = RotationCache.get(kv_head_dim, seed, device)
-        self.k_qjl = QJLProjection(kv_head_dim, seed=seed + 50, device=device)
 
         # V: b-bit MSE only
         self.v_cb = CodebookRegistry.get(kv_head_dim, bit_width, device)
@@ -398,6 +408,39 @@ class TQQuantizedCache:
 
     def is_compressible(self, layer_idx):
         return layer_idx in self.ga_indices
+
+    def _compress_kv(self, K_flat, V_flat, batch, num_heads, head_dim):
+        """Compress flat K/V tensors according to key_strategy.
+
+        Returns a dict with compressed representation.
+        """
+        v_idx, v_n = tq_quantize_mse(V_flat, self.v_cb, self.v_rot)
+        if self.key_strategy == "mse+qjl":
+            k_mse, k_qjl, k_rn, k_n = tq_quantize_prod(
+                K_flat, self.k_cb, self.k_rot, self.k_qjl,
+            )
+            return {
+                "k_mse": k_mse, "k_qjl": k_qjl, "k_rn": k_rn, "k_n": k_n,
+                "v_idx": v_idx, "v_n": v_n,
+                "batch": batch, "num_heads": num_heads, "head_dim": head_dim,
+            }
+        else:
+            k_idx, k_n = tq_quantize_mse(K_flat, self.k_cb, self.k_rot)
+            return {
+                "k_mse": k_idx, "k_n": k_n,
+                "v_idx": v_idx, "v_n": v_n,
+                "batch": batch, "num_heads": num_heads, "head_dim": head_dim,
+            }
+
+    def _merge_compressed(self, old, new):
+        """Concatenate two compressed cache entries."""
+        merged = {}
+        for key in old:
+            if isinstance(old[key], torch.Tensor):
+                merged[key] = torch.cat([old[key], new[key]], dim=0)
+            else:
+                merged[key] = new[key]
+        return merged
 
     def update(self, K, V, layer_idx):
         """Store K/V for a layer. Compresses GatedAttn layers, stores raw otherwise.
@@ -442,33 +485,18 @@ class TQQuantizedCache:
             self._window_k[layer_idx] = window_k[:, :, overflow_len:, :]
             self._window_v[layer_idx] = window_v[:, :, overflow_len:, :]
 
-            # Compress the overflow
             oc_b, oc_nh, oc_sl, oc_hd = to_compress_k.shape
             Kf = to_compress_k.reshape(oc_b * oc_nh * oc_sl, oc_hd)
             Vf = to_compress_v.reshape(oc_b * oc_nh * oc_sl, oc_hd)
 
-            k_mse, k_qjl, k_rn, k_n = tq_quantize_prod(Kf, self.k_cb, self.k_rot, self.k_qjl)
-            v_idx, v_n = tq_quantize_mse(Vf, self.v_cb, self.v_rot)
-
-            new_entry = {
-                "k_mse": k_mse, "k_qjl": k_qjl, "k_rn": k_rn, "k_n": k_n,
-                "v_idx": v_idx, "v_n": v_n,
-                "batch": oc_b, "num_heads": oc_nh, "head_dim": oc_hd,
-            }
+            new_entry = self._compress_kv(Kf, Vf, oc_b, oc_nh, oc_hd)
 
             if self._cache[layer_idx] is None:
                 self._cache[layer_idx] = new_entry
             else:
-                old = self._cache[layer_idx]
-                self._cache[layer_idx] = {
-                    "k_mse": torch.cat([old["k_mse"], new_entry["k_mse"]], dim=0),
-                    "k_qjl": torch.cat([old["k_qjl"], new_entry["k_qjl"]], dim=0),
-                    "k_rn": torch.cat([old["k_rn"], new_entry["k_rn"]], dim=0),
-                    "k_n": torch.cat([old["k_n"], new_entry["k_n"]], dim=0),
-                    "v_idx": torch.cat([old["v_idx"], new_entry["v_idx"]], dim=0),
-                    "v_n": torch.cat([old["v_n"], new_entry["v_n"]], dim=0),
-                    "batch": oc_b, "num_heads": oc_nh, "head_dim": oc_hd,
-                }
+                self._cache[layer_idx] = self._merge_compressed(
+                    self._cache[layer_idx], new_entry,
+                )
 
             self._seq_lens[layer_idx] = (
                 self._compressed_seq_len(layer_idx) + self._window_k[layer_idx].shape[2]
@@ -479,36 +507,22 @@ class TQQuantizedCache:
             self._window_v[layer_idx] = window_v
             self._seq_lens[layer_idx] = window_k.shape[2]
         else:
-            # No residual window: compress everything immediately (original behavior)
+            # No residual window: compress everything immediately
             self._window_k[layer_idx] = None
             self._window_v[layer_idx] = None
 
             Kf = K.reshape(b * nh * sl, hd)
             Vf = V.reshape(b * nh * sl, hd)
 
-            k_mse, k_qjl, k_rn, k_n = tq_quantize_prod(Kf, self.k_cb, self.k_rot, self.k_qjl)
-            v_idx, v_n = tq_quantize_mse(Vf, self.v_cb, self.v_rot)
-
-            new_entry = {
-                "k_mse": k_mse, "k_qjl": k_qjl, "k_rn": k_rn, "k_n": k_n,
-                "v_idx": v_idx, "v_n": v_n,
-                "batch": b, "num_heads": nh, "head_dim": hd,
-            }
+            new_entry = self._compress_kv(Kf, Vf, b, nh, hd)
 
             if self._cache[layer_idx] is None:
                 self._cache[layer_idx] = new_entry
                 self._seq_lens[layer_idx] = sl
             else:
-                old = self._cache[layer_idx]
-                self._cache[layer_idx] = {
-                    "k_mse": torch.cat([old["k_mse"], new_entry["k_mse"]], dim=0),
-                    "k_qjl": torch.cat([old["k_qjl"], new_entry["k_qjl"]], dim=0),
-                    "k_rn": torch.cat([old["k_rn"], new_entry["k_rn"]], dim=0),
-                    "k_n": torch.cat([old["k_n"], new_entry["k_n"]], dim=0),
-                    "v_idx": torch.cat([old["v_idx"], new_entry["v_idx"]], dim=0),
-                    "v_n": torch.cat([old["v_n"], new_entry["v_n"]], dim=0),
-                    "batch": b, "num_heads": nh, "head_dim": hd,
-                }
+                self._cache[layer_idx] = self._merge_compressed(
+                    self._cache[layer_idx], new_entry,
+                )
                 self._seq_lens[layer_idx] += sl
 
     def _compressed_seq_len(self, layer_idx):
@@ -581,24 +595,27 @@ class TQQuantizedCache:
         compressed_len = self._compressed_seq_len(layer_idx)
         c_shape = (b, nh, compressed_len, hd)
 
-        # Stage 1: MSE-reconstructed K for biased scores
+        # MSE-reconstructed K
         K_mse = tq_dequantize_mse(
             entry["k_mse"], entry["k_n"], self.k_cb, self.k_rot
         ).reshape(c_shape)
         scores_mse = Q @ K_mse.transpose(-2, -1)
 
-        # Stage 2: QJL bias correction
-        Q_flat = Q.reshape(b * nh * q_len, hd)
-        Q_qjl = self.k_qjl.quantize(Q_flat).reshape(b * nh, q_len, hd)
-        k_qjl = entry["k_qjl"].reshape(b * nh, compressed_len, hd)
+        # QJL bias correction (only if key_strategy == "mse+qjl")
+        if self.key_strategy == "mse+qjl":
+            Q_flat = Q.reshape(b * nh * q_len, hd)
+            Q_qjl = self.k_qjl.quantize(Q_flat).reshape(b * nh, q_len, hd)
+            k_qjl = entry["k_qjl"].reshape(b * nh, compressed_len, hd)
 
-        correction = Q_qjl.float() @ k_qjl.float().transpose(-2, -1)
-        correction = correction * (math.pi / (2 * hd))
-        correction = correction * entry["k_rn"].reshape(b * nh, 1, compressed_len)
-        correction = correction * entry["k_n"].reshape(b * nh, 1, compressed_len)
-        correction = correction.reshape(b, nh, q_len, compressed_len)
+            correction = Q_qjl.float() @ k_qjl.float().transpose(-2, -1)
+            correction = correction * (math.pi / (2 * hd))
+            correction = correction * entry["k_rn"].reshape(b * nh, 1, compressed_len)
+            correction = correction * entry["k_n"].reshape(b * nh, 1, compressed_len)
+            correction = correction.reshape(b, nh, q_len, compressed_len)
 
-        compressed_scores = (scores_mse + correction) / (hd ** 0.5)
+            compressed_scores = (scores_mse + correction) / (hd ** 0.5)
+        else:
+            compressed_scores = scores_mse / (hd ** 0.5)
 
         # Decompress V from compressed region
         V_compressed = tq_dequantize_mse(

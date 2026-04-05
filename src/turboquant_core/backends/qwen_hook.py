@@ -38,7 +38,8 @@ from ..core import (
 
 def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
                          num_layers=32, full_attn_interval=4,
-                         kv_heads=4, head_dim=256, residual_window=0):
+                         kv_heads=4, head_dim=256, residual_window=0,
+                         key_strategy="mse+qjl"):
     """Patch a Qwen3.5 model to use TurboQuant compressed KV cache.
 
     Args:
@@ -62,6 +63,7 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
         kv_head_dim=head_dim, num_kv_heads=kv_heads,
         bit_width=bit_width, seed=seed, device=device,
         residual_window=residual_window,
+        key_strategy=key_strategy,
     )
 
     # Find the attention layers in the model
@@ -88,7 +90,7 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
 
 def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None, *,
                         num_layers=36, kv_heads=8, head_dim=128,
-                        residual_window=0):
+                        residual_window=0, key_strategy="mse+qjl"):
     """Patch a Qwen3-8B model to use TurboQuant compressed KV cache.
 
     All layers are dense attention and compressible.
@@ -113,6 +115,58 @@ def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None, *,
         kv_head_dim=head_dim, num_kv_heads=kv_heads,
         bit_width=bit_width, seed=seed, device=device,
         residual_window=residual_window,
+        key_strategy=key_strategy,
+    )
+
+    layers = _get_model_layers(model)
+    if layers is None:
+        raise ValueError(
+            "Could not find transformer layers in model. "
+            "Expected model.model.layers or similar structure."
+        )
+
+    for layer_idx, layer in enumerate(layers):
+        attn = _get_attention_module(layer)
+        if attn is None:
+            continue
+
+        _patch_attention_forward(attn, cache, layer_idx)
+
+    return cache
+
+
+def patch_qwen25_with_tq(model, bit_width=4, seed=42, device=None, *,
+                         num_layers=36, kv_heads=2, head_dim=128,
+                         residual_window=0, key_strategy="mse+qjl"):
+    """Patch a Qwen2.5 model to use TurboQuant compressed KV cache.
+
+    Qwen2.5-3B-Instruct: 36 dense attention layers, 2 KV heads, head_dim 128.
+    All layers are compressible (f=1.0). This is the recommended first
+    ablation target due to small size and direct community comparability.
+
+    Args:
+        model: A Qwen2.5 CausalLM model from transformers.
+        bit_width: Total bits per value.
+        seed: Random seed for rotation and QJL matrices.
+        device: Device for TQ buffers. Defaults to model's device.
+        num_layers: Number of transformer layers (default 36).
+        kv_heads: Number of KV heads (default 2).
+        head_dim: Head dimension (default 128).
+        residual_window: Number of recent tokens to keep in FP16 (default 0).
+        key_strategy: "mse+qjl" or "mse" (default "mse+qjl").
+
+    Returns:
+        TQQuantizedCache instance. Call cache.clear() between generations.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    cache = TQQuantizedCache(
+        num_layers=num_layers, interval=1,
+        kv_head_dim=head_dim, num_kv_heads=kv_heads,
+        bit_width=bit_width, seed=seed, device=device,
+        residual_window=residual_window,
+        key_strategy=key_strategy,
     )
 
     layers = _get_model_layers(model)
@@ -288,34 +342,35 @@ def _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads,
 
         scores_mse = Q @ K_mse_expanded.transpose(-2, -1)
 
-        # QJL correction at KV head granularity, then expand
-        # Compressed data is flat [bsz * num_kv_heads * kv_len, ...]; reshape to per-head
-        k_qjl_all = entry["k_qjl"].reshape(bsz, num_kv_heads, kv_len, head_dim)
-        k_rn_all = entry["k_rn"].reshape(bsz, num_kv_heads, kv_len)
-        k_n_all = entry["k_n"].reshape(bsz, num_kv_heads, kv_len)
+        if cache.key_strategy == "mse+qjl":
+            # QJL correction at KV head granularity, then expand
+            k_qjl_all = entry["k_qjl"].reshape(bsz, num_kv_heads, kv_len, head_dim)
+            k_rn_all = entry["k_rn"].reshape(bsz, num_kv_heads, kv_len)
+            k_n_all = entry["k_n"].reshape(bsz, num_kv_heads, kv_len)
 
-        Q_grouped = Q.reshape(bsz, num_kv_heads, num_groups, q_len, head_dim)
-        correction_per_kv = []
-        for g in range(num_kv_heads):
-            Q_g = Q_grouped[:, g].reshape(bsz * num_groups * q_len, head_dim)
-            Q_qjl = cache.k_qjl.quantize(Q_g).reshape(bsz * num_groups, q_len, head_dim)
+            Q_grouped = Q.reshape(bsz, num_kv_heads, num_groups, q_len, head_dim)
+            correction_per_kv = []
+            for g in range(num_kv_heads):
+                Q_g = Q_grouped[:, g].reshape(bsz * num_groups * q_len, head_dim)
+                Q_qjl = cache.k_qjl.quantize(Q_g).reshape(bsz * num_groups, q_len, head_dim)
 
-            # Per KV head g: [bsz, kv_len, head_dim] -> expand for groups
-            k_qjl_g = k_qjl_all[:, g].unsqueeze(1).expand(-1, num_groups, -1, -1)
-            k_qjl_g = k_qjl_g.reshape(bsz * num_groups, kv_len, head_dim)
+                k_qjl_g = k_qjl_all[:, g].unsqueeze(1).expand(-1, num_groups, -1, -1)
+                k_qjl_g = k_qjl_g.reshape(bsz * num_groups, kv_len, head_dim)
 
-            corr = Q_qjl.float() @ k_qjl_g.float().transpose(-2, -1)
-            corr = corr * (math.pi / (2 * head_dim))
-            k_rn_g = k_rn_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
-            k_n_g = k_n_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
-            corr = corr * k_rn_g.reshape(bsz * num_groups, 1, kv_len)
-            corr = corr * k_n_g.reshape(bsz * num_groups, 1, kv_len)
-            correction_per_kv.append(corr.reshape(bsz, num_groups, q_len, kv_len))
+                corr = Q_qjl.float() @ k_qjl_g.float().transpose(-2, -1)
+                corr = corr * (math.pi / (2 * head_dim))
+                k_rn_g = k_rn_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
+                k_n_g = k_n_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
+                corr = corr * k_rn_g.reshape(bsz * num_groups, 1, kv_len)
+                corr = corr * k_n_g.reshape(bsz * num_groups, 1, kv_len)
+                correction_per_kv.append(corr.reshape(bsz, num_groups, q_len, kv_len))
 
-        correction = torch.stack(correction_per_kv, dim=1)
-        correction = correction.reshape(bsz, num_q_heads, q_len, kv_len)
+            correction = torch.stack(correction_per_kv, dim=1)
+            correction = correction.reshape(bsz, num_q_heads, q_len, kv_len)
 
-        scores = (scores_mse + correction) / (head_dim ** 0.5)
+            scores = (scores_mse + correction) / (head_dim ** 0.5)
+        else:
+            scores = scores_mse / (head_dim ** 0.5)
         if causal_mask is not None:
             scores = _apply_mask(scores, causal_mask, attention_mask)
         attn = torch.softmax(scores, dim=-1)

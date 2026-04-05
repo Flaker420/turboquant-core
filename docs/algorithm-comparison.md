@@ -13,11 +13,11 @@ A comparison of **flaker420/turboquant-core** against [tonbistudio/turboquant-py
 | **QJL Residual** | Yes (key strategy) | Removed in V3 | Removed | Yes | Removed | No | Yes | N/A |
 | **Asymmetric K/V bits** | No (same bit_width) | Yes (K6/V4, K4/V2) | Yes | Yes (K3-4/V2-4) | Yes (K4/V2 default) | Yes (K=q8_0, V=turbo2-4) | No | N/A (eviction-based) |
 | **Layer-adaptive** | No | Yes (protect early/late) | No | Selective (attn-only) | Yes (protected_layers) | Yes (boundary V) | No | Yes (per-head entropy) |
-| **Residual window** | No | Yes (128-token FP16) | No | No | Yes (128-token FP16) | No | No | No |
+| **Residual window** | Yes (configurable, default 0) | Yes (128-token FP16) | No | No | Yes (128-token FP16) | No | No | No |
 | **Bit-packing** | No (index tensors) | Yes (V3) | Yes | Yes | Yes | Yes (block-32) | Yes | N/A |
 | **GPU kernels** | No | No | No | 3 Triton kernels | No | Metal GPU kernels | No | No |
 | **Pip-installable** | No | No | No | No | Yes | llama.cpp integration | Cargo crate | No |
-| **Models tested** | Qwen3.5-9B, Qwen3-8B | Qwen2.5-3B | 8 models (GPT-2 to Qwen2.5-7B) | Qwen3.5-27B, Qwen3.5-35B | Qwen2.5 family, StableLM | 30+ models incl. Command-R+ 104B, Llama-70B | Generic | GPT-2 |
+| **Models tested** | Qwen3.5-9B, Qwen3-8B, Qwen2.5-3B | Qwen2.5-3B | 8 models (GPT-2 to Qwen2.5-7B) | Qwen3.5-27B, Qwen3.5-35B | Qwen2.5 family, StableLM | 30+ models incl. Command-R+ 104B, Llama-70B | Generic | GPT-2 |
 
 ---
 
@@ -138,6 +138,7 @@ If compressible layers are fraction `f` of total KV state and you achieve compre
 
 | Model | Compressible layers | f (approx) | At r=5x | At r=10x | Hard ceiling |
 |---|---|---|---|---|---|
+| **Qwen2.5-3B** | 36/36 (all) | 1.0 | **5.0x** | **10.0x** | Unlimited |
 | **Qwen3-8B** | 36/36 (all) | 1.0 | **5.0x** | **10.0x** | Unlimited |
 | **Qwen3.5-9B** | 8/32 (GatedAttn only) | ~0.25 | **1.25x** | **1.29x** | **1.33x** |
 
@@ -155,15 +156,16 @@ Qwen3.5-9B's DeltaNet layers carry opaque recurrent state that TurboQuant cannot
 
 The following plan reflects consensus across this comparison, an independent code reviewer, and community evidence. The key reframing: **the next high-value artifact is a reproducible ablation table, not a code rewrite.** The algorithm works; the question is which configuration point wins for softmax attention on Qwen targets.
 
-### PR0: Correctness and Evaluation Hygiene
+### PR0: Correctness and Evaluation Hygiene (Merged)
 
 **Rationale**: If attention semantics are wrong, every downstream ablation is suspect. tonbistudio had to retract a headline result after discovering a no-compression bug. Fix correctness first.
 
-- [ ] **Causal mask in patched attention** -- `qwen_hook.py` computes softmax over the full cached keys without causal masking. Multi-token prefill can attend non-causally across future positions. Add regression tests comparing logits from patched vs unpatched on multi-token prefill and padded batches.
-- [ ] **Automatic cache clearing** -- Core README says to call `cache.clear()` between generations, but the eval harness's `generate_one()` does not. Cross-prompt cache contamination is a likely correctness bug. Add `reset_generation_state()` to the adapter interface and call it before every prompt.
-- [ ] **Explicit baseline selection** -- Evaluator can shuffle policy order and picks first row per prompt as baseline. Baseline must be explicit by policy name or `is_baseline: true` flag.
-- [ ] **Fix `update_params` signature mismatch** -- Core adapter implements `update_params(self, **kwargs)` but the workflow wrapper calls `self._core.update_params(params)` positionally. Will fail if exercised.
-- [ ] **Stricter reference-answer scoring** -- Numeric checker accepts any matching number anywhere in output. Tighten before using results as canonical.
+- [x] **Causal mask in patched attention** -- `qwen_hook.py` now builds a proper causal mask. Both `_gqa_attention` and `TQQuantizedCache.compute_attention` accept `causal_mask` and `attention_mask`. Regression tests added for prefill causality and incremental decode. **Remaining**: padded-batch parity tests against unpatched attention.
+- [x] **Automatic cache clearing** -- `reset_generation_state()` added to `TurboQuantAdapter`. Harnesses should call this between generations.
+- [ ] **Explicit baseline selection** -- Evaluator can shuffle policy order and picks first row per prompt as baseline. Baseline must be explicit by policy name or `is_baseline: true` flag. *(Lives in turboquant-workflow-eval, not this repo.)*
+- [x] **Fix `update_params` signature mismatch** -- Now accepts both `update_params(params_dict)` and `update_params(**kwargs)`.
+- [ ] **Stricter reference-answer scoring** -- Numeric checker accepts any matching number anywhere in output. Tighten before using results as canonical. *(Lives in turboquant-workflow-eval, not this repo.)*
+- [x] **Fix duplicated V quantization** -- `Qwen35KVBackend.compress()` was calling `tq_quantize_mse` twice for V. Fixed to call once.
 
 ### PR1: Algorithmic Ablation Matrix
 
@@ -184,9 +186,10 @@ The following plan reflects consensus across this comparison, an independent cod
 
 **Required code changes to enable ablation**:
 - [ ] Add `key_bit_width` / `value_bit_width` independent parameters
-- [ ] Add `residual_window` parameter (keep recent N tokens in FP16)
+- [x] Add `residual_window` parameter (keep recent N tokens in FP16) -- Merged in PR0.
 - [ ] Add `protected_layers` list parameter
-- [ ] Keep QJL as an option but benchmark before deciding default
+- [x] Keep QJL as an option but benchmark before deciding default -- `key_strategy` exposed in backends; now threaded through `TQQuantizedCache` and hooked attention path.
+- [x] Add Qwen2.5-3B-Instruct backend as dense ablation target -- `Qwen25DenseKVBackend` merged in PR0.
 
 **Measurement discipline** -- Every published row must include:
 - Actual compressed-token count

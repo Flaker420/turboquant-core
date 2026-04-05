@@ -8,7 +8,9 @@ from turboquant_core.core import TQQuantizedCache
 from turboquant_core.backends.qwen import (
     Qwen35KVBackend, Qwen25DenseKVBackend,
 )
-from turboquant_core.backends.qwen_hook import patch_qwen3_with_tq
+from turboquant_core.backends.qwen_hook import (
+    patch_qwen3_with_tq, patch_qwen25_with_tq,
+)
 from turboquant_core.adapters.workflow_eval import (
     TurboQuantAdapter, _detect_variant,
 )
@@ -394,6 +396,121 @@ class TestResidualWindowHook:
         policy_cfg = {"settings": {"bit_width": 4, "residual_window": 64}}
         adapter.prepare_model(model, None, model_cfg, policy_cfg)
         assert adapter._cache.residual_window == 64
+
+
+# ---------------------------------------------------------------------------
+# Tests: key_strategy threading through TQQuantizedCache
+# ---------------------------------------------------------------------------
+
+class TestKeyStrategyCache:
+    def test_mse_only_cache_no_qjl(self):
+        """MSE-only cache should not create a QJL projection."""
+        cache = TQQuantizedCache(
+            num_layers=4, interval=1,
+            kv_head_dim=128, num_kv_heads=2,
+            bit_width=4, seed=42, key_strategy="mse",
+        )
+        assert cache.key_strategy == "mse"
+        assert cache.k_qjl is None
+
+    def test_mse_qjl_cache_has_qjl(self):
+        """MSE+QJL cache should have a QJL projection."""
+        cache = TQQuantizedCache(
+            num_layers=4, interval=1,
+            kv_head_dim=128, num_kv_heads=2,
+            bit_width=4, seed=42, key_strategy="mse+qjl",
+        )
+        assert cache.key_strategy == "mse+qjl"
+        assert cache.k_qjl is not None
+
+    def test_invalid_key_strategy_raises(self):
+        """Invalid key_strategy should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid key_strategy"):
+            TQQuantizedCache(
+                num_layers=4, interval=1,
+                kv_head_dim=128, num_kv_heads=2,
+                bit_width=4, key_strategy="invalid",
+            )
+
+    def test_mse_only_compress_and_attention(self):
+        """MSE-only cache should compress/decompress without QJL fields."""
+        cache = TQQuantizedCache(
+            num_layers=4, interval=1,
+            kv_head_dim=128, num_kv_heads=2,
+            bit_width=4, seed=42, key_strategy="mse",
+        )
+        K = torch.randn(1, 2, 8, 128)
+        V = torch.randn(1, 2, 8, 128)
+        cache.update(K, V, layer_idx=0)
+
+        entry = cache._cache[0]
+        assert "k_qjl" not in entry
+        assert "k_rn" not in entry
+
+        Q = torch.randn(1, 2, 1, 128)
+        output = cache.compute_attention(Q, layer_idx=0)
+        assert output.shape == (1, 2, 1, 128)
+        assert not torch.isnan(output).any()
+
+    def test_mse_only_with_residual_window(self):
+        """MSE-only + residual window should work together."""
+        cache = TQQuantizedCache(
+            num_layers=4, interval=1,
+            kv_head_dim=128, num_kv_heads=2,
+            bit_width=4, seed=42, key_strategy="mse",
+            residual_window=4,
+        )
+        K = torch.randn(1, 2, 8, 128)
+        V = torch.randn(1, 2, 8, 128)
+        cache.update(K, V, layer_idx=0)
+
+        Q = torch.randn(1, 2, 1, 128)
+        output = cache.compute_attention(Q, layer_idx=0)
+        assert output.shape == (1, 2, 1, 128)
+        assert not torch.isnan(output).any()
+
+
+class TestKeyStrategyHook:
+    def test_patch_qwen3_mse_only(self):
+        """Patching with key_strategy='mse' should propagate."""
+        model = _make_qwen3_mock()
+        cache = patch_qwen3_with_tq(model, bit_width=4, key_strategy="mse")
+        assert cache.key_strategy == "mse"
+        assert cache.k_qjl is None
+
+    def test_patch_qwen25_mse_only(self):
+        """patch_qwen25_with_tq with MSE-only should work end-to-end."""
+        model = _make_qwen25_mock()
+        cache = patch_qwen25_with_tq(model, bit_width=4, key_strategy="mse")
+        assert cache.key_strategy == "mse"
+        assert cache.kv_head_dim == 128
+        assert cache.num_kv_heads == 2
+
+        # Run a forward pass through layer 0
+        bsz, seq_len = 1, 4
+        hidden_size = 16 * 128
+        hidden_states = torch.randn(bsz, seq_len, hidden_size)
+        layer = model.model.layers[0]
+        output, _, _ = layer.self_attn(hidden_states)
+        assert output.shape == (bsz, seq_len, hidden_size)
+        assert not torch.isnan(output).any()
+
+    def test_adapter_key_strategy(self):
+        """Adapter should pass key_strategy from settings."""
+        adapter = TurboQuantAdapter()
+        model = _make_qwen25_mock()
+        model_cfg = {"name": "Qwen/Qwen2.5-3B-Instruct"}
+        policy_cfg = {"settings": {"bit_width": 4, "key_strategy": "mse"}}
+        adapter.prepare_model(model, None, model_cfg, policy_cfg)
+        assert adapter._cache.key_strategy == "mse"
+
+    def test_patch_qwen25_defaults(self):
+        """patch_qwen25_with_tq should use Qwen2.5-3B defaults."""
+        model = _make_qwen25_mock()
+        cache = patch_qwen25_with_tq(model, bit_width=4)
+        assert cache.num_layers == 36
+        assert cache.kv_head_dim == 128
+        assert cache.num_kv_heads == 2
 
 
 if __name__ == "__main__":
