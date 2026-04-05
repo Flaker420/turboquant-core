@@ -513,5 +513,111 @@ class TestKeyStrategyHook:
         assert cache.num_kv_heads == 2
 
 
+# ---------------------------------------------------------------------------
+# Tests: GQA + residual window (the bug the reviewer caught)
+# ---------------------------------------------------------------------------
+
+class TestGQAResidualWindow:
+    def test_gqa_residual_window_prefill(self):
+        """GQA model with residual_window should work during prefill."""
+        model = _make_qwen3_mock()  # 16 Q heads, 8 KV heads → GQA
+        patch_qwen3_with_tq(
+            model, bit_width=4, residual_window=4, key_strategy="mse",
+        )
+
+        bsz, seq_len = 1, 8
+        hidden_size = 16 * 128
+        hidden_states = torch.randn(bsz, seq_len, hidden_size)
+
+        layer = model.model.layers[0]
+        output, _, _ = layer.self_attn(hidden_states)
+        assert output.shape == (bsz, seq_len, hidden_size)
+        assert not torch.isnan(output).any()
+
+    def test_gqa_residual_window_overflow(self):
+        """GQA with tokens exceeding residual window should compress overflow."""
+        model = _make_qwen25_mock()  # 16 Q heads, 2 KV heads → GQA
+        cache = patch_qwen25_with_tq(
+            model, bit_width=4, residual_window=4, key_strategy="mse",
+        )
+
+        bsz = 1
+        hidden_size = 16 * 128
+
+        # Prefill with 8 tokens (4 overflow → compressed, 4 in window)
+        layer = model.model.layers[0]
+        hidden_states = torch.randn(bsz, 8, hidden_size)
+        output, _, _ = layer.self_attn(hidden_states)
+        assert output.shape == (bsz, 8, hidden_size)
+        assert not torch.isnan(output).any()
+
+        # Verify window + compressed split
+        assert cache._window_k[0] is not None
+        assert cache._window_k[0].shape[2] == 4
+        assert cache._cache[0] is not None
+
+    def test_gqa_residual_window_incremental_decode(self):
+        """GQA with residual window should handle incremental decode."""
+        model = _make_qwen25_mock()
+        cache = patch_qwen25_with_tq(
+            model, bit_width=4, residual_window=3, key_strategy="mse",
+        )
+
+        bsz = 1
+        hidden_size = 16 * 128
+        layer = model.model.layers[0]
+
+        # Prefill with 4 tokens
+        hidden_states = torch.randn(bsz, 4, hidden_size)
+        output, _, _ = layer.self_attn(hidden_states)
+        assert output.shape == (bsz, 4, hidden_size)
+
+        # Decode 3 more tokens one at a time
+        for _ in range(3):
+            decode = torch.randn(bsz, 1, hidden_size)
+            output, _, _ = layer.self_attn(decode)
+            assert output.shape == (bsz, 1, hidden_size)
+            assert not torch.isnan(output).any()
+
+        # Total should be 7: 4 compressed + 3 in window
+        assert cache.get_seq_length(0) == 7
+
+    def test_gqa_residual_window_qjl(self):
+        """GQA + residual window + QJL should also work."""
+        model = _make_qwen3_mock()
+        patch_qwen3_with_tq(
+            model, bit_width=4, residual_window=4, key_strategy="mse+qjl",
+        )
+
+        bsz = 1
+        hidden_size = 16 * 128
+        hidden_states = torch.randn(bsz, 8, hidden_size)
+
+        layer = model.model.layers[0]
+        output, _, _ = layer.self_attn(hidden_states)
+        assert output.shape == (bsz, 8, hidden_size)
+        assert not torch.isnan(output).any()
+
+    def test_gqa_window_only_no_compressed(self):
+        """When all tokens fit in window, GQA should use FP16 path."""
+        model = _make_qwen25_mock()
+        cache = patch_qwen25_with_tq(
+            model, bit_width=4, residual_window=16, key_strategy="mse",
+        )
+
+        bsz = 1
+        hidden_size = 16 * 128
+        hidden_states = torch.randn(bsz, 4, hidden_size)
+
+        layer = model.model.layers[0]
+        output, _, _ = layer.self_attn(hidden_states)
+        assert output.shape == (bsz, 4, hidden_size)
+        assert not torch.isnan(output).any()
+
+        # All in window, nothing compressed
+        assert cache._cache[0] is None
+        assert cache._window_k[0] is not None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
