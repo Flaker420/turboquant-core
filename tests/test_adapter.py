@@ -3,7 +3,10 @@
 import torch.nn as nn
 import pytest
 
-from turboquant_core.adapters.workflow_eval import TurboQuantAdapter, _detect_variant
+from turboquant_core.adapters.workflow_eval import (
+    TurboQuantAdapter, _detect_variant, register_variant, _VARIANT_REGISTRY,
+)
+from turboquant_core.backends.qwen import Qwen35KVBackend, Qwen3DenseKVBackend
 from turboquant_core.core import TQQuantizedCache
 
 
@@ -62,16 +65,26 @@ def _make_qwen3_mock():
 
 class TestDetectVariant:
     def test_qwen35_from_name(self):
-        assert _detect_variant({"name": "Qwen/Qwen3.5-9B"}, {}) == "qwen35"
+        vid, cls = _detect_variant({"name": "Qwen/Qwen3.5-9B"}, {})
+        assert vid == "qwen35"
+        assert cls is Qwen35KVBackend
 
     def test_qwen3_from_name(self):
-        assert _detect_variant({"name": "Qwen/Qwen3-8B"}, {}) == "qwen3"
+        vid, cls = _detect_variant({"name": "Qwen/Qwen3-8B"}, {})
+        assert vid == "qwen3"
+        assert cls is Qwen3DenseKVBackend
 
     def test_explicit_override(self):
-        # model_variant in settings takes precedence over model_cfg name
-        assert _detect_variant(
+        vid, cls = _detect_variant(
             {"name": "Qwen/Qwen3.5-9B"}, {"model_variant": "qwen3"}
-        ) == "qwen3"
+        )
+        assert vid == "qwen3"
+        assert cls is Qwen3DenseKVBackend
+
+    def test_explicit_override_unknown_variant(self):
+        vid, cls = _detect_variant({"name": "X"}, {"model_variant": "custom"})
+        assert vid == "custom"
+        assert cls is None
 
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="Cannot detect model variant"):
@@ -80,6 +93,41 @@ class TestDetectVariant:
     def test_empty_name_raises(self):
         with pytest.raises(ValueError, match="Cannot detect model variant"):
             _detect_variant({}, {})
+
+
+# ---------------------------------------------------------------------------
+# Tests: register_variant (Phase 6)
+# ---------------------------------------------------------------------------
+
+class TestRegisterVariant:
+    def test_register_and_detect(self):
+        # Register a custom variant
+        class FakeBackend:
+            pass
+
+        original_len = len(_VARIANT_REGISTRY)
+        register_variant("Qwen4", "qwen4", FakeBackend)
+        try:
+            vid, cls = _detect_variant({"name": "Qwen4-16B"}, {})
+            assert vid == "qwen4"
+            assert cls is FakeBackend
+        finally:
+            # Clean up the registry
+            _VARIANT_REGISTRY.pop(0)
+            assert len(_VARIANT_REGISTRY) == original_len
+
+    def test_register_takes_priority(self):
+        """Newly registered variants are checked first (inserted at index 0)."""
+        class OverrideBackend:
+            pass
+
+        register_variant("Qwen3", "qwen3_override", OverrideBackend)
+        try:
+            vid, cls = _detect_variant({"name": "Qwen3-8B"}, {})
+            assert vid == "qwen3_override"
+            assert cls is OverrideBackend
+        finally:
+            _VARIANT_REGISTRY.pop(0)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +175,23 @@ class TestTurboQuantAdapter:
         model = _make_qwen35_mock()
         with pytest.raises(ValueError):
             adapter.prepare_model(model, None, {"name": "Unknown"}, {"settings": {}})
+
+    def test_prepare_model_with_layout_override(self):
+        """Phase 2: layout overrides from model_cfg are passed through."""
+        adapter = TurboQuantAdapter()
+        # Use a smaller mock matching the layout
+        model = MockModel(
+            num_layers=16, hidden_size=8 * 256,
+            num_heads=8, num_kv_heads=4, head_dim=256,
+        )
+        model_cfg = {
+            "name": "Qwen/Qwen3.5-9B",
+            "layout": {"num_layers": 16, "full_attn_interval": 4},
+        }
+        policy_cfg = {"settings": {"bit_width": 4}}
+
+        adapter.prepare_model(model, None, model_cfg, policy_cfg)
+        assert adapter._cache.num_layers == 16
 
     def test_describe(self):
         adapter = TurboQuantAdapter()
@@ -183,14 +248,12 @@ class TestTurboQuantAdapter:
 
         adapter.prepare_model(model, None, {"name": "Qwen/Qwen3.5-9B"}, {"settings": {}})
         assert adapter.can_revert() is True
-        # Layer 3 is compressible and should be patched
         assert hasattr(model.model.layers[3].self_attn.forward, '__wrapped__')
 
         result = adapter.revert(model)
         assert result is True
         assert adapter.can_revert() is False
         assert adapter._cache is None
-        # Forward should be restored (no __wrapped__ = original bound method)
         assert not hasattr(model.model.layers[3].self_attn.forward, '__wrapped__')
 
     def test_revert_without_prepare_returns_false(self):
@@ -205,7 +268,7 @@ class TestTurboQuantAdapter:
         assert adapter.revert(model) is True
         assert adapter.revert(model) is False
 
-    # -- get_state -------------------------------------------------------------
+    # -- get_state (Phase 3) ---------------------------------------------------
 
     def test_get_state_before_prepare(self):
         adapter = TurboQuantAdapter()
@@ -216,6 +279,7 @@ class TestTurboQuantAdapter:
             "bit_width": None,
             "seed": None,
             "patched": False,
+            "backend": None,
         }
 
     def test_get_state_after_prepare(self):
@@ -233,6 +297,7 @@ class TestTurboQuantAdapter:
             "bit_width": 2,
             "seed": 99,
             "patched": True,
+            "backend": "Qwen3DenseKVBackend",
         }
 
     def test_get_state_after_revert(self):
@@ -242,7 +307,13 @@ class TestTurboQuantAdapter:
         adapter.revert(model)
         state = adapter.get_state()
         assert state["patched"] is False
-        assert state["variant"] == "qwen3"  # variant preserved
+        assert state["variant"] == "qwen3"
+
+    def test_get_state_backend_qwen35(self):
+        adapter = TurboQuantAdapter()
+        model = _make_qwen35_mock()
+        adapter.prepare_model(model, None, {"name": "Qwen/Qwen3.5-9B"}, {"settings": {}})
+        assert adapter.get_state()["backend"] == "Qwen35KVBackend"
 
     # -- update_params ---------------------------------------------------------
 

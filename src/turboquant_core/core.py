@@ -110,6 +110,21 @@ class CodebookRegistry:
                               cb.centroids.to(device), cb.boundaries.to(device), cb.mse_per_coord)
         return cb
 
+    @classmethod
+    def list_cached(cls) -> list[tuple[int, int]]:
+        """Return cached (dimension, bit_width) pairs."""
+        return list(cls._cache.keys())
+
+    @classmethod
+    def precompute(cls, d: int, b: int, device=torch.device("cpu")) -> TQCodebook:
+        """Compute, cache, and return a codebook for the given dimension and bit width."""
+        return cls.get(d, b, device)
+
+    @classmethod
+    def clear(cls):
+        """Drop all cached codebooks."""
+        cls._cache.clear()
+
 
 # ---------------------------------------------------------------------------
 # Rotation cache (fast Walsh-Hadamard transform)

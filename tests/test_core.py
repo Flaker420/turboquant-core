@@ -592,6 +592,134 @@ def test_bit_width_kv_asymmetry_semantics():
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Phase 2: Configurable backend constructors
+# ---------------------------------------------------------------------------
+
+def test_qwen35_backend_custom_params():
+    """Qwen35KVBackend accepts custom layout params."""
+    backend = Qwen35KVBackend(
+        bit_width=4, num_layers=16, full_attn_interval=4, kv_heads=2, head_dim=256,
+    )
+    assert backend.num_layers == 16
+    assert backend.full_attn_interval == 4
+    assert backend.kv_heads == 2
+    assert backend.head_dim == 256
+    # ga_indices should be based on custom num_layers
+    assert backend.ga_indices == {3, 7, 11, 15}
+
+
+def test_qwen3_backend_custom_params():
+    """Qwen3DenseKVBackend accepts custom layout params."""
+    backend = Qwen3DenseKVBackend(
+        bit_width=4, num_layers=18, kv_heads=4, head_dim=128,
+    )
+    assert backend.num_layers == 18
+    assert backend.kv_heads == 4
+    assert backend.head_dim == 128
+    assert backend.is_compressible(17)  # all layers compressible
+
+
+def test_backend_defaults_match_constants():
+    """Default constructor args match original class constants."""
+    b35 = Qwen35KVBackend()
+    assert b35.num_layers == Qwen35KVBackend.NUM_LAYERS
+    assert b35.full_attn_interval == Qwen35KVBackend.FULL_ATTN_INTERVAL
+    assert b35.kv_heads == Qwen35KVBackend.GA_KV_HEADS
+    assert b35.head_dim == Qwen35KVBackend.GA_HEAD_DIM
+
+    b3 = Qwen3DenseKVBackend()
+    assert b3.num_layers == Qwen3DenseKVBackend.NUM_LAYERS
+    assert b3.kv_heads == Qwen3DenseKVBackend.KV_HEADS
+    assert b3.head_dim == Qwen3DenseKVBackend.HEAD_DIM
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Flexible algorithm selection
+# ---------------------------------------------------------------------------
+
+def test_qwen35_backend_mse_only_strategy():
+    """key_strategy='mse' uses full bit_width for K with no QJL."""
+    backend = Qwen35KVBackend(bit_width=4, key_strategy="mse")
+    assert backend.key_strategy == "mse"
+    assert backend.k_qjl is None
+    # K codebook should use full bit_width (4 bits = 16 centroids)
+    assert backend.k_cb.centroids.shape[0] == 16
+
+    # Compress and verify no QJL keys
+    K = torch.randn(1, 4, 8, 256)
+    V = torch.randn(1, 4, 8, 256)
+    compressed = backend.compress(K, V, 3)
+    assert "k_qjl" not in compressed
+    assert "k_rn" not in compressed
+
+
+def test_qwen35_backend_default_strategy():
+    """Default key_strategy='mse+qjl' allocates (b-1) bits to MSE + 1 to QJL."""
+    backend = Qwen35KVBackend(bit_width=4)
+    assert backend.key_strategy == "mse+qjl"
+    assert backend.k_qjl is not None
+    # K codebook should use bit_width-1 (3 bits = 8 centroids)
+    assert backend.k_cb.centroids.shape[0] == 8
+
+
+def test_qwen3_backend_mse_only_attention_scores():
+    """MSE-only strategy produces valid attention scores (no correction term)."""
+    backend = Qwen3DenseKVBackend(bit_width=4, key_strategy="mse")
+    K = torch.randn(1, 8, 4, 128)
+    V = torch.randn(1, 8, 4, 128)
+    Q = torch.randn(1, 8, 2, 128)
+    compressed = backend.compress(K, V, 0)
+    scores = backend.compute_attention_scores(Q, compressed)
+    assert scores.shape == (1, 8, 2, 4)
+    assert not torch.isnan(scores).any()
+
+
+def test_invalid_key_strategy_raises():
+    """Invalid key_strategy raises ValueError."""
+    import pytest
+    with pytest.raises(ValueError, match="Invalid key_strategy"):
+        Qwen35KVBackend(key_strategy="invalid")
+
+
+def test_invalid_value_strategy_raises():
+    """Invalid value_strategy raises ValueError."""
+    import pytest
+    with pytest.raises(ValueError, match="Invalid value_strategy"):
+        Qwen35KVBackend(value_strategy="invalid")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Open CodebookRegistry API
+# ---------------------------------------------------------------------------
+
+def test_codebook_registry_list_cached():
+    """list_cached() returns previously computed (d, b) pairs."""
+    # Ensure at least one entry exists
+    CodebookRegistry.get(256, 3)
+    cached = CodebookRegistry.list_cached()
+    assert (256, 3) in cached
+
+
+def test_codebook_registry_precompute():
+    """precompute() computes, caches, and returns a codebook."""
+    cb = CodebookRegistry.precompute(64, 2)
+    assert cb.dimension == 64
+    assert cb.bit_width == 2
+    assert cb.centroids.shape[0] == 4  # 2^2 = 4 centroids
+    assert (64, 2) in CodebookRegistry.list_cached()
+
+
+def test_codebook_registry_clear():
+    """clear() drops all cached codebooks."""
+    CodebookRegistry.get(256, 4)
+    assert len(CodebookRegistry.list_cached()) > 0
+    CodebookRegistry.clear()
+    assert len(CodebookRegistry.list_cached()) == 0
+    # Re-populate for other tests that depend on cached codebooks
+    CodebookRegistry.get(256, 4)
+
+
 # Main
 # ---------------------------------------------------------------------------
 
