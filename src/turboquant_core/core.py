@@ -371,12 +371,14 @@ class TQQuantizedCache:
 
     def __init__(self, num_layers=32, interval=4,
                  kv_head_dim=256, num_kv_heads=4,
-                 bit_width=4, seed=42, device=torch.device("cpu")):
+                 bit_width=4, seed=42, device=torch.device("cpu"),
+                 residual_window=0):
         self.num_layers = num_layers
         self.ga_indices = {i for i in range(num_layers) if (i + 1) % interval == 0}
         self.kv_head_dim = kv_head_dim
         self.num_kv_heads = num_kv_heads
         self.device = device
+        self.residual_window = residual_window
 
         # K: (b-1)-bit MSE + 1-bit QJL
         self.k_cb = CodebookRegistry.get(kv_head_dim, bit_width - 1, device)
@@ -390,12 +392,19 @@ class TQQuantizedCache:
         # Per-layer storage: compressed dicts for GA layers, raw tensors for others
         self._cache = [None] * num_layers
         self._seq_lens = [0] * num_layers
+        # Residual window: recent tokens kept in FP16 per compressible layer
+        self._window_k = [None] * num_layers
+        self._window_v = [None] * num_layers
 
     def is_compressible(self, layer_idx):
         return layer_idx in self.ga_indices
 
     def update(self, K, V, layer_idx):
         """Store K/V for a layer. Compresses GatedAttn layers, stores raw otherwise.
+
+        When residual_window > 0, the most recent `residual_window` tokens per
+        compressible layer are kept in full FP16 precision. Older tokens that
+        fall outside the window are compressed and moved to the quantized cache.
 
         K, V shape: [batch, num_heads, seq_len, head_dim]
         """
@@ -412,95 +421,216 @@ class TQQuantizedCache:
             self._seq_lens[layer_idx] = self._cache[layer_idx][0].shape[2]
             return
 
-        # Compress for GatedAttn layers
         b, nh, sl, hd = K.shape
-        Kf = K.reshape(b * nh * sl, hd)
-        Vf = V.reshape(b * nh * sl, hd)
 
-        k_mse, k_qjl, k_rn, k_n = tq_quantize_prod(Kf, self.k_cb, self.k_rot, self.k_qjl)
-        v_idx, v_n = tq_quantize_mse(Vf, self.v_cb, self.v_rot)
-
-        new_entry = {
-            "k_mse": k_mse, "k_qjl": k_qjl, "k_rn": k_rn, "k_n": k_n,
-            "v_idx": v_idx, "v_n": v_n,
-            "batch": b, "num_heads": nh, "head_dim": hd,
-        }
-
-        if self._cache[layer_idx] is None:
-            self._cache[layer_idx] = new_entry
-            self._seq_lens[layer_idx] = sl
+        # Append new tokens to the FP16 residual window
+        if self._window_k[layer_idx] is None:
+            window_k = K
+            window_v = V
         else:
-            old = self._cache[layer_idx]
-            self._cache[layer_idx] = {
-                "k_mse": torch.cat([old["k_mse"], new_entry["k_mse"]], dim=0),
-                "k_qjl": torch.cat([old["k_qjl"], new_entry["k_qjl"]], dim=0),
-                "k_rn": torch.cat([old["k_rn"], new_entry["k_rn"]], dim=0),
-                "k_n": torch.cat([old["k_n"], new_entry["k_n"]], dim=0),
-                "v_idx": torch.cat([old["v_idx"], new_entry["v_idx"]], dim=0),
-                "v_n": torch.cat([old["v_n"], new_entry["v_n"]], dim=0),
+            window_k = torch.cat([self._window_k[layer_idx], K], dim=2)
+            window_v = torch.cat([self._window_v[layer_idx], V], dim=2)
+
+        rw = self.residual_window
+        if rw > 0 and window_k.shape[2] > rw:
+            # Tokens that have aged out of the window → compress them
+            overflow_len = window_k.shape[2] - rw
+            to_compress_k = window_k[:, :, :overflow_len, :]
+            to_compress_v = window_v[:, :, :overflow_len, :]
+
+            # Keep the recent rw tokens in FP16
+            self._window_k[layer_idx] = window_k[:, :, overflow_len:, :]
+            self._window_v[layer_idx] = window_v[:, :, overflow_len:, :]
+
+            # Compress the overflow
+            oc_b, oc_nh, oc_sl, oc_hd = to_compress_k.shape
+            Kf = to_compress_k.reshape(oc_b * oc_nh * oc_sl, oc_hd)
+            Vf = to_compress_v.reshape(oc_b * oc_nh * oc_sl, oc_hd)
+
+            k_mse, k_qjl, k_rn, k_n = tq_quantize_prod(Kf, self.k_cb, self.k_rot, self.k_qjl)
+            v_idx, v_n = tq_quantize_mse(Vf, self.v_cb, self.v_rot)
+
+            new_entry = {
+                "k_mse": k_mse, "k_qjl": k_qjl, "k_rn": k_rn, "k_n": k_n,
+                "v_idx": v_idx, "v_n": v_n,
+                "batch": oc_b, "num_heads": oc_nh, "head_dim": oc_hd,
+            }
+
+            if self._cache[layer_idx] is None:
+                self._cache[layer_idx] = new_entry
+            else:
+                old = self._cache[layer_idx]
+                self._cache[layer_idx] = {
+                    "k_mse": torch.cat([old["k_mse"], new_entry["k_mse"]], dim=0),
+                    "k_qjl": torch.cat([old["k_qjl"], new_entry["k_qjl"]], dim=0),
+                    "k_rn": torch.cat([old["k_rn"], new_entry["k_rn"]], dim=0),
+                    "k_n": torch.cat([old["k_n"], new_entry["k_n"]], dim=0),
+                    "v_idx": torch.cat([old["v_idx"], new_entry["v_idx"]], dim=0),
+                    "v_n": torch.cat([old["v_n"], new_entry["v_n"]], dim=0),
+                    "batch": oc_b, "num_heads": oc_nh, "head_dim": oc_hd,
+                }
+
+            self._seq_lens[layer_idx] = (
+                self._compressed_seq_len(layer_idx) + self._window_k[layer_idx].shape[2]
+            )
+        elif rw > 0:
+            # All tokens fit in the window — no compression yet
+            self._window_k[layer_idx] = window_k
+            self._window_v[layer_idx] = window_v
+            self._seq_lens[layer_idx] = window_k.shape[2]
+        else:
+            # No residual window: compress everything immediately (original behavior)
+            self._window_k[layer_idx] = None
+            self._window_v[layer_idx] = None
+
+            Kf = K.reshape(b * nh * sl, hd)
+            Vf = V.reshape(b * nh * sl, hd)
+
+            k_mse, k_qjl, k_rn, k_n = tq_quantize_prod(Kf, self.k_cb, self.k_rot, self.k_qjl)
+            v_idx, v_n = tq_quantize_mse(Vf, self.v_cb, self.v_rot)
+
+            new_entry = {
+                "k_mse": k_mse, "k_qjl": k_qjl, "k_rn": k_rn, "k_n": k_n,
+                "v_idx": v_idx, "v_n": v_n,
                 "batch": b, "num_heads": nh, "head_dim": hd,
             }
-            self._seq_lens[layer_idx] += sl
+
+            if self._cache[layer_idx] is None:
+                self._cache[layer_idx] = new_entry
+                self._seq_lens[layer_idx] = sl
+            else:
+                old = self._cache[layer_idx]
+                self._cache[layer_idx] = {
+                    "k_mse": torch.cat([old["k_mse"], new_entry["k_mse"]], dim=0),
+                    "k_qjl": torch.cat([old["k_qjl"], new_entry["k_qjl"]], dim=0),
+                    "k_rn": torch.cat([old["k_rn"], new_entry["k_rn"]], dim=0),
+                    "k_n": torch.cat([old["k_n"], new_entry["k_n"]], dim=0),
+                    "v_idx": torch.cat([old["v_idx"], new_entry["v_idx"]], dim=0),
+                    "v_n": torch.cat([old["v_n"], new_entry["v_n"]], dim=0),
+                    "batch": b, "num_heads": nh, "head_dim": hd,
+                }
+                self._seq_lens[layer_idx] += sl
+
+    def _compressed_seq_len(self, layer_idx):
+        """Return the number of tokens in the compressed cache for a layer."""
+        entry = self._cache[layer_idx]
+        if entry is None:
+            return 0
+        b = entry["batch"]
+        nh = entry["num_heads"]
+        total_flat = entry["k_mse"].shape[0]
+        return total_flat // (b * nh)
 
     def get_seq_length(self, layer_idx=0):
         return self._seq_lens[layer_idx]
 
-    def compute_attention(self, Q, layer_idx):
+    def compute_attention(self, Q, layer_idx, causal_mask=None, attention_mask=None):
         """Compute attention output: softmax(Q @ K^T / sqrt(d)) @ V.
 
         For compressed layers, uses QJL-corrected attention scores.
         For raw layers, uses standard attention.
+        When residual_window > 0, combines compressed scores with FP16 window scores.
 
-        Q shape: [batch, num_heads, q_len, head_dim]
+        Args:
+            Q: [batch, num_heads, q_len, head_dim]
+            layer_idx: Layer index.
+            causal_mask: Optional [1, 1, q_len, kv_len] boolean mask (True = attend).
+            attention_mask: Optional HF-style mask [batch, 1, q_len/1, kv_len]
+                with 0 for valid, large negative for masked positions.
+
         Returns: [batch, num_heads, q_len, head_dim]
         """
-        entry = self._cache[layer_idx]
-        if entry is None:
-            raise ValueError(f"No cache for layer {layer_idx}")
-
         if not self.is_compressible(layer_idx):
+            entry = self._cache[layer_idx]
+            if entry is None:
+                raise ValueError(f"No cache for layer {layer_idx}")
             K, V = entry
             scores = Q @ K.transpose(-2, -1) / (Q.shape[-1] ** 0.5)
+            if causal_mask is not None:
+                scores = scores.masked_fill(~causal_mask, float("-inf"))
+            if attention_mask is not None:
+                scores = scores + attention_mask
             attn = torch.softmax(scores, dim=-1)
             return attn @ V
 
+        entry = self._cache[layer_idx]
+        has_compressed = entry is not None
+        has_window = self._window_k[layer_idx] is not None
+
+        if not has_compressed and not has_window:
+            raise ValueError(f"No cache for layer {layer_idx}")
+
+        q_len = Q.shape[2]
+        hd = Q.shape[3]
+
+        # --- Window-only path (all tokens in FP16) ---
+        if not has_compressed and has_window:
+            wk = self._window_k[layer_idx]
+            wv = self._window_v[layer_idx]
+            scores = Q @ wk.transpose(-2, -1) / (hd ** 0.5)
+            if causal_mask is not None:
+                scores = scores.masked_fill(~causal_mask, float("-inf"))
+            if attention_mask is not None:
+                scores = scores + attention_mask
+            attn = torch.softmax(scores, dim=-1)
+            return attn @ wv
+
+        # --- Compressed path (possibly with residual window) ---
         b = entry["batch"]
         nh = entry["num_heads"]
-        hd = entry["head_dim"]
-        kv_len = self._seq_lens[layer_idx]
-        q_len = Q.shape[2]
-        shape = (b, nh, kv_len, hd)
+        compressed_len = self._compressed_seq_len(layer_idx)
+        c_shape = (b, nh, compressed_len, hd)
 
         # Stage 1: MSE-reconstructed K for biased scores
         K_mse = tq_dequantize_mse(
             entry["k_mse"], entry["k_n"], self.k_cb, self.k_rot
-        ).reshape(shape)
+        ).reshape(c_shape)
         scores_mse = Q @ K_mse.transpose(-2, -1)
 
         # Stage 2: QJL bias correction
         Q_flat = Q.reshape(b * nh * q_len, hd)
         Q_qjl = self.k_qjl.quantize(Q_flat).reshape(b * nh, q_len, hd)
-        k_qjl = entry["k_qjl"].reshape(b * nh, kv_len, hd)
+        k_qjl = entry["k_qjl"].reshape(b * nh, compressed_len, hd)
 
         correction = Q_qjl.float() @ k_qjl.float().transpose(-2, -1)
         correction = correction * (math.pi / (2 * hd))
-        correction = correction * entry["k_rn"].reshape(b * nh, 1, kv_len)
-        correction = correction * entry["k_n"].reshape(b * nh, 1, kv_len)
-        correction = correction.reshape(b, nh, q_len, kv_len)
+        correction = correction * entry["k_rn"].reshape(b * nh, 1, compressed_len)
+        correction = correction * entry["k_n"].reshape(b * nh, 1, compressed_len)
+        correction = correction.reshape(b, nh, q_len, compressed_len)
 
-        scores = (scores_mse + correction) / (hd ** 0.5)
-        attn = torch.softmax(scores, dim=-1)
+        compressed_scores = (scores_mse + correction) / (hd ** 0.5)
 
-        # Decompress V and apply attention weights
-        V_decompressed = tq_dequantize_mse(
+        # Decompress V from compressed region
+        V_compressed = tq_dequantize_mse(
             entry["v_idx"], entry["v_n"], self.v_cb, self.v_rot
-        ).reshape(shape)
+        ).reshape(c_shape)
 
-        return attn @ V_decompressed
+        if has_window:
+            # Combine compressed scores with FP16 window scores
+            wk = self._window_k[layer_idx]
+            wv = self._window_v[layer_idx]
+            window_scores = Q @ wk.transpose(-2, -1) / (hd ** 0.5)
+
+            # Concatenate: [compressed_scores | window_scores]
+            all_scores = torch.cat([compressed_scores, window_scores], dim=-1)
+            # Concatenate: [V_compressed | V_window]
+            all_V = torch.cat([V_compressed, wv], dim=2)
+        else:
+            all_scores = compressed_scores
+            all_V = V_compressed
+
+        if causal_mask is not None:
+            all_scores = all_scores.masked_fill(~causal_mask, float("-inf"))
+        if attention_mask is not None:
+            all_scores = all_scores + attention_mask
+        attn = torch.softmax(all_scores, dim=-1)
+        return attn @ all_V
 
     def clear(self):
         self._cache = [None] * self.num_layers
         self._seq_lens = [0] * self.num_layers
+        self._window_k = [None] * self.num_layers
+        self._window_v = [None] * self.num_layers
 
 
 # ---------------------------------------------------------------------------

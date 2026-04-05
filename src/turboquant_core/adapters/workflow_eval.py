@@ -15,7 +15,7 @@ Usage in a workflow-eval policy YAML:
 
 from __future__ import annotations
 
-from ..backends.qwen import Qwen35KVBackend, Qwen3DenseKVBackend
+from ..backends.qwen import Qwen35KVBackend, Qwen3DenseKVBackend, Qwen25DenseKVBackend
 from ..backends.qwen_hook import patch_qwen35_with_tq, patch_qwen3_with_tq, unpatch_model
 
 
@@ -26,6 +26,7 @@ from ..backends.qwen_hook import patch_qwen35_with_tq, patch_qwen3_with_tq, unpa
 _VARIANT_REGISTRY: list[tuple[str, str, type]] = [
     ("Qwen3.5", "qwen35", Qwen35KVBackend),
     ("Qwen3", "qwen3", Qwen3DenseKVBackend),
+    ("Qwen2.5", "qwen25", Qwen25DenseKVBackend),
 ]
 
 
@@ -64,6 +65,7 @@ class TurboQuantAdapter:
         settings = policy_cfg.get("settings", {})
         bit_width = settings.get("bit_width", 4)
         seed = settings.get("seed", 42)
+        residual_window = settings.get("residual_window", 0)
 
         self._bit_width = bit_width
         self._seed = seed
@@ -77,11 +79,18 @@ class TurboQuantAdapter:
 
         if variant == "qwen35":
             self._cache = patch_qwen35_with_tq(
-                model, bit_width=bit_width, seed=seed, **layout,
+                model, bit_width=bit_width, seed=seed,
+                residual_window=residual_window, **layout,
             )
         elif variant == "qwen3":
             self._cache = patch_qwen3_with_tq(
-                model, bit_width=bit_width, seed=seed, **layout,
+                model, bit_width=bit_width, seed=seed,
+                residual_window=residual_window, **layout,
+            )
+        elif variant == "qwen25":
+            self._cache = patch_qwen3_with_tq(
+                model, bit_width=bit_width, seed=seed,
+                residual_window=residual_window, **layout,
             )
         else:
             raise ValueError(f"Unsupported model variant: {variant!r}")
@@ -131,10 +140,23 @@ class TurboQuantAdapter:
             "backend": self._backend_name,
         }
 
-    def update_params(self, **kwargs) -> bool:
+    def reset_generation_state(self) -> None:
+        """Clear the KV cache between generations.
+
+        Must be called before each new prompt to prevent cross-prompt
+        cache contamination. Harnesses should call this automatically
+        rather than relying on callers to remember cache.clear().
+        """
+        if self._cache is not None:
+            self._cache.clear()
+
+    def update_params(self, params: dict = None, **kwargs) -> bool:
         """Update compression parameters on a live model.
 
         Not yet supported — requires revert + re-prepare.
+
+        Accepts both positional dict and keyword arguments for compatibility
+        with workflow-eval wrappers that call update_params(params).
 
         Returns:
             False always.
@@ -182,7 +204,7 @@ def _extract_layout(model_cfg: dict, variant: str) -> dict:
         for key in ("num_layers", "full_attn_interval", "kv_heads", "head_dim"):
             if key in layout:
                 kwargs[key] = layout[key]
-    elif variant == "qwen3":
+    elif variant in ("qwen3", "qwen25"):
         for key in ("num_layers", "kv_heads", "head_dim"):
             if key in layout:
                 kwargs[key] = layout[key]

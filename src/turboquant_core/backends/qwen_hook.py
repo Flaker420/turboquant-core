@@ -38,7 +38,7 @@ from ..core import (
 
 def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
                          num_layers=32, full_attn_interval=4,
-                         kv_heads=4, head_dim=256):
+                         kv_heads=4, head_dim=256, residual_window=0):
     """Patch a Qwen3.5 model to use TurboQuant compressed KV cache.
 
     Args:
@@ -61,6 +61,7 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
         num_layers=num_layers, interval=full_attn_interval,
         kv_head_dim=head_dim, num_kv_heads=kv_heads,
         bit_width=bit_width, seed=seed, device=device,
+        residual_window=residual_window,
     )
 
     # Find the attention layers in the model
@@ -86,7 +87,8 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
 
 
 def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None, *,
-                        num_layers=36, kv_heads=8, head_dim=128):
+                        num_layers=36, kv_heads=8, head_dim=128,
+                        residual_window=0):
     """Patch a Qwen3-8B model to use TurboQuant compressed KV cache.
 
     All layers are dense attention and compressible.
@@ -110,6 +112,7 @@ def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None, *,
         num_layers=num_layers, interval=1,
         kv_head_dim=head_dim, num_kv_heads=kv_heads,
         bit_width=bit_width, seed=seed, device=device,
+        residual_window=residual_window,
     )
 
     layers = _get_model_layers(model)
@@ -199,12 +202,35 @@ def _patch_attention_forward(attn_module, cache, layer_idx):
         # Store compressed K/V in the TQ cache
         cache.update(K, V, layer_idx)
 
+        # Build causal mask: query positions can only attend to key positions <= their own
+        kv_len = cache.get_seq_length(layer_idx)
+        # Query positions are the last q_len positions in the sequence
+        q_start = kv_len - q_len
+        # causal_mask[i, j] = True means position i can attend to position j
+        q_positions = torch.arange(q_start, kv_len, device=Q.device).unsqueeze(1)
+        k_positions = torch.arange(kv_len, device=Q.device).unsqueeze(0)
+        causal_mask = k_positions <= q_positions  # [q_len, kv_len]
+
+        # Combine with external attention_mask if provided (e.g. padding mask)
+        if attention_mask is not None:
+            # attention_mask from HF is [batch, 1, q_len, kv_len] or [batch, 1, 1, kv_len]
+            # with 0 for valid positions and large negative values for masked positions
+            combined_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, q_len, kv_len]
+        else:
+            combined_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, q_len, kv_len]
+
         # Compute attention using the full cache (including previous tokens)
         if num_q_heads != num_kv_heads:
             # GQA: Q has more heads than K/V, need manual head expansion
-            attn_output = _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads)
+            attn_output = _gqa_attention(
+                Q, cache, layer_idx, num_q_heads, num_kv_heads,
+                causal_mask=combined_mask, attention_mask=attention_mask,
+            )
         else:
-            attn_output = cache.compute_attention(Q, layer_idx)
+            attn_output = cache.compute_attention(
+                Q, layer_idx,
+                causal_mask=combined_mask, attention_mask=attention_mask,
+            )
 
         # Reshape back: [batch, heads, seq_len, head_dim] -> [batch, seq_len, hidden_dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -218,7 +244,25 @@ def _patch_attention_forward(attn_module, cache, layer_idx):
     attn_module.forward = tq_forward
 
 
-def _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads):
+def _apply_mask(scores, causal_mask, attention_mask):
+    """Apply causal and padding masks to attention scores.
+
+    Args:
+        scores: [batch, heads, q_len, kv_len]
+        causal_mask: [1, 1, q_len, kv_len] boolean (True = attend)
+        attention_mask: Optional HF-style mask [batch, 1, q_len/1, kv_len]
+            with 0 for valid, large negative for masked positions.
+    """
+    # Apply causal mask (True = can attend, False = masked)
+    scores = scores.masked_fill(~causal_mask, float("-inf"))
+    # Apply padding mask if provided
+    if attention_mask is not None:
+        scores = scores + attention_mask
+    return scores
+
+
+def _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads,
+                   causal_mask=None, attention_mask=None):
     """Handle grouped-query attention with TQ cache.
 
     Qwen3.5-9B: 24 Q heads, 4 KV heads → groups of 6 Q heads per KV head.
@@ -272,6 +316,8 @@ def _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads):
         correction = correction.reshape(bsz, num_q_heads, q_len, kv_len)
 
         scores = (scores_mse + correction) / (head_dim ** 0.5)
+        if causal_mask is not None:
+            scores = _apply_mask(scores, causal_mask, attention_mask)
         attn = torch.softmax(scores, dim=-1)
 
         # Decompress V and expand for GQA
@@ -291,6 +337,8 @@ def _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads):
         V_expanded = V_expanded.reshape(bsz, num_q_heads, -1, head_dim)
 
         scores = Q @ K_expanded.transpose(-2, -1) / (head_dim ** 0.5)
+        if causal_mask is not None:
+            scores = _apply_mask(scores, causal_mask, attention_mask)
         attn = torch.softmax(scores, dim=-1)
         return attn @ V_expanded
 
