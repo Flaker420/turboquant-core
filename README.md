@@ -20,6 +20,18 @@ Pure Python/PyTorch implementation of TurboQuant (ICLR 2026): Lloyd-Max codebook
 | `Qwen35KVBackend` | Qwen3.5-9B | 8 GatedAttn (of 32) | K→TQ_prod, V→TQ_MSE |
 | `Qwen3DenseKVBackend` | Qwen3-8B | All 36 | K→TQ_prod, V→TQ_MSE |
 
+Backend constructors accept configurable layout params with keyword-only args:
+
+```python
+# Custom model dimensions (defaults match standard model configs)
+backend = Qwen35KVBackend(
+    bit_width=4, seed=42, device="cuda",
+    num_layers=32, full_attn_interval=4, kv_heads=4, head_dim=256,
+    key_strategy="mse+qjl",   # or "mse" for MSE-only (no QJL correction)
+    value_strategy="mse",
+)
+```
+
 ### Compress / decompress
 
 ```python
@@ -49,6 +61,74 @@ model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", ...)
 cache = patch_qwen3_with_tq(model, bit_width=4)
 ```
 
+Patch functions also accept configurable layout overrides:
+
+```python
+cache = patch_qwen35_with_tq(model, bit_width=4,
+    num_layers=32, full_attn_interval=4, kv_heads=4, head_dim=256)
+```
+
+### Unpatching (model revert)
+
+```python
+from turboquant_core import unpatch_model
+
+count = unpatch_model(model)  # restores original forwards, returns count
+```
+
+## Codebook registry
+
+```python
+from turboquant_core import CodebookRegistry
+
+cb = CodebookRegistry.precompute(256, 4)       # compute + cache + return
+cached = CodebookRegistry.list_cached()         # [(256, 4), ...]
+CodebookRegistry.clear()                        # drop all cached codebooks
+```
+
+## Variant registry
+
+Register custom model variants for auto-detection by the adapter:
+
+```python
+from turboquant_core import register_variant
+
+class MyBackend:
+    ...
+
+register_variant("Qwen4", "qwen4", MyBackend)
+```
+
+## Integration with turboquant-workflow-eval
+
+The `TurboQuantAdapter` bridges `turboquant-core` to the eval harness:
+
+```python
+from turboquant_core import TurboQuantAdapter
+
+adapter = TurboQuantAdapter()
+adapter.prepare_model(model, tokenizer, model_cfg, policy_cfg)
+
+adapter.can_revert()          # True if model is patched
+adapter.revert(model)         # unpatch + clear cache
+adapter.get_state()           # {"adapter", "variant", "bit_width", "seed", "patched", "backend"}
+adapter.update_params()       # False (not yet supported)
+```
+
+Policy YAML settings:
+
+```yaml
+adapter:
+  import_path: "turboquant_core.adapters.workflow_eval:TurboQuantAdapter"
+  settings:
+    bit_width: 4
+    seed: 42
+    key_strategy: "mse+qjl"   # or "mse"
+    value_strategy: "mse"
+```
+
+See `docs/HANDOFF.md` for full wiring instructions.
+
 ## Install
 
 ```bash
@@ -67,10 +147,6 @@ pytest tests/ -v
 ```bash
 python benchmarks/benchmark_kv_cache.py
 ```
-
-## Integration with turboquant-workflow-eval
-
-This library provides the real TQ backend for the adapter interface in [turboquant-workflow-eval](https://github.com/Flaker420/turboquant-workflow-eval). See `docs/HANDOFF.md` for wiring instructions.
 
 ## Reference
 

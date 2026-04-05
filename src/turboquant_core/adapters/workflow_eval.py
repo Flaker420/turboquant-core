@@ -64,8 +64,6 @@ class TurboQuantAdapter:
         settings = policy_cfg.get("settings", {})
         bit_width = settings.get("bit_width", 4)
         seed = settings.get("seed", 42)
-        key_strategy = settings.get("key_strategy", "mse+qjl")
-        value_strategy = settings.get("value_strategy", "mse")
 
         self._bit_width = bit_width
         self._seed = seed
