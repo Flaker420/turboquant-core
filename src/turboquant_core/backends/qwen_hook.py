@@ -1,28 +1,34 @@
 """
 Hook-in module for patching Qwen models to use TurboQuant compressed KV cache.
 
+Supported models:
+    - Qwen3.5-9B (hybrid: 8 GatedAttn layers compressed, DeltaNet unchanged)
+    - Qwen3-8B (dense: all 36 layers compressed)
+    - Qwen2.5-3B-Instruct (dense: all 36 layers, 2 KV heads)
+
 Usage:
-    from transformers import AutoModelForCausalLM
-    from turboquant_core.backends.qwen_hook import patch_qwen35_with_tq, patch_qwen3_with_tq
+    from turboquant_core.backends.qwen_hook import (
+        patch_qwen35_with_tq, patch_qwen3_with_tq, patch_qwen25_with_tq,
+    )
 
-    # Qwen3.5-9B (hybrid: 8 GatedAttn layers compressed, DeltaNet layers unchanged)
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-9B", ...)
-    cache = patch_qwen35_with_tq(model, bit_width=4)
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-3B-Instruct", ...)
+    cache = patch_qwen25_with_tq(
+        model, bit_width=4, key_strategy="mse", residual_window=128,
+    )
 
-    # Qwen3-8B (dense: all 36 layers compressed)
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", ...)
-    cache = patch_qwen3_with_tq(model, bit_width=4)
-
-    # Now model.generate() uses compressed KV cache automatically.
-    # cache.clear() between generations.
+    # model.generate() now uses compressed KV cache automatically.
+    # Call cache.clear() between generations (or use adapter.reset_generation_state()).
 
 This module monkey-patches attention layers' forward to:
 1. Compress K/V into the TQQuantizedCache after projection
-2. Use QJL-corrected attention scores for K (instead of raw matmul)
-3. Decompress V for the attention output
-4. Pass through non-compressible layers unchanged (Qwen3.5-9B DeltaNet layers)
+2. Apply causal masking for correct multi-token prefill
+3. Compute attention scores (MSE-only or MSE+QJL corrected, per key_strategy)
+4. When residual_window > 0, keep recent tokens in FP16 and compress older ones
+5. Handle GQA head expansion for all three data layouts (window-only,
+   compressed-only, compressed+window)
+6. Pass through non-compressible layers unchanged (Qwen3.5 DeltaNet layers)
 
-Requires: transformers with Qwen3/Qwen3.5 support.
+Requires: transformers with Qwen2.5/Qwen3/Qwen3.5 support.
 """
 
 import math
@@ -212,10 +218,11 @@ def _patch_attention_forward(attn_module, cache, layer_idx):
     """Patch an attention module to use TQ compressed KV cache.
 
     The patched forward:
-    1. Computes Q, K, V projections as normal
-    2. Stores compressed K/V in the TQQuantizedCache
-    3. Computes attention using QJL-corrected scores
-    4. Returns the attention output
+    1. Computes Q, K, V projections and applies rotary embeddings
+    2. Stores K/V in the TQQuantizedCache (compressed or FP16 window)
+    3. Builds a causal mask for correct multi-token prefill
+    4. Computes attention via GQA-aware path (MSE-only or MSE+QJL)
+    5. Returns (attn_output, None, past_key_value)
     """
     attn_module._tq_original_forward = attn_module.forward
     original_forward = attn_module.forward

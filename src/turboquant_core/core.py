@@ -353,20 +353,21 @@ class TQGatedAttnKVCache:
 # ---------------------------------------------------------------------------
 
 class TQQuantizedCache:
-    """Drop-in compressed KV cache for Qwen3.5-9B GatedAttn layers.
+    """Compressed KV cache with configurable quantization strategy.
 
-    Stores KV cache in compressed form (uint8 MSE indices + int8 QJL bits +
-    float32 norms) instead of full float16/bfloat16 tensors. Provides the
-    corrected attention interface: compute_attention returns unbiased
-    softmax(Q @ K^T) @ V using QJL correction.
+    Supports Qwen3.5 (hybrid GatedAttn/DeltaNet), Qwen3 (dense), and
+    Qwen2.5 (dense) architectures. For non-compressible layers (DeltaNet),
+    stores K/V in original precision.
 
-    For DeltaNet layers (non-compressible), stores K/V in original precision.
-
-    Memory savings at bit_width=4, head_dim=256:
-      - Original: 2 bytes/element (bfloat16) = 512 bytes/token/head for K+V
-      - Compressed K: 1 byte (MSE) + 1 byte (QJL) + 8 bytes (norms) per token
-      - Compressed V: 1 byte (MSE) + 4 bytes (norm) per token
-      - Total compressed: ~270 bytes/token/head → ~1.9x reduction
+    Key features:
+      - key_strategy="mse": Full b-bit MSE codebook for keys (no QJL).
+        Community consensus finds this outperforms MSE+QJL through softmax.
+      - key_strategy="mse+qjl": (b-1)-bit MSE + 1-bit QJL residual
+        correction (original paper approach).
+      - residual_window=N: Keep the most recent N tokens in FP16,
+        compress only older tokens. Critical for generation quality.
+      - Causal masking: compute_attention() accepts causal_mask and
+        attention_mask for correct multi-token prefill semantics.
     """
 
     def __init__(self, num_layers=32, interval=4,

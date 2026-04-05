@@ -4,7 +4,7 @@ TurboQuant algorithm library with model-specific KV cache backends.
 
 ## What it is
 
-Pure Python/PyTorch implementation of TurboQuant (ICLR 2026): Lloyd-Max codebook quantization with random rotation and QJL residual correction for unbiased inner product estimation.
+Pure Python/PyTorch implementation of TurboQuant (ICLR 2026): Lloyd-Max codebook quantization with random rotation and optional QJL residual correction for KV cache compression.
 
 ## Algorithms
 
@@ -15,57 +15,68 @@ Pure Python/PyTorch implementation of TurboQuant (ICLR 2026): Lloyd-Max codebook
 
 ## Model backends
 
-| Backend | Model | KV layers | Strategy |
+| Backend | Model | KV layers | Default K/V strategy |
 |---|---|---|---|
-| `Qwen35KVBackend` | Qwen3.5-9B | 8 GatedAttn (of 32) | K→TQ_prod, V→TQ_MSE |
-| `Qwen3DenseKVBackend` | Qwen3-8B | All 36 | K→TQ_prod, V→TQ_MSE |
+| `Qwen25DenseKVBackend` | Qwen2.5-3B-Instruct | All 36 | Configurable: `mse` or `mse+qjl` / `mse` |
+| `Qwen3DenseKVBackend` | Qwen3-8B | All 36 | Configurable: `mse` or `mse+qjl` / `mse` |
+| `Qwen35KVBackend` | Qwen3.5-9B | 8 GatedAttn (of 32) | Configurable: `mse` or `mse+qjl` / `mse` |
 
-Backend constructors accept configurable layout params with keyword-only args:
+All backends accept `key_strategy="mse"` (MSE-only, community-recommended for softmax attention) or `key_strategy="mse+qjl"` (original paper approach with QJL correction).
 
 ```python
-# Custom model dimensions (defaults match standard model configs)
-backend = Qwen35KVBackend(
+backend = Qwen25DenseKVBackend(
     bit_width=4, seed=42, device="cuda",
-    num_layers=32, full_attn_interval=4, kv_heads=4, head_dim=256,
-    key_strategy="mse+qjl",   # or "mse" for MSE-only (no QJL correction)
+    key_strategy="mse",       # MSE-only (no QJL) — recommended default
     value_strategy="mse",
 )
-```
-
-### Compress / decompress
-
-```python
-from turboquant_core.backends.qwen import Qwen35KVBackend
-
-backend = Qwen35KVBackend(bit_width=4, device="cuda")
-if backend.is_compressible(layer_idx=3):
-    compressed = backend.compress(K, V, layer_idx=3)
-    V_restored = backend.decompress_v(compressed)
-    attn_scores = backend.compute_attention_scores(Q, compressed)
 ```
 
 ### Model hook-in (drop-in KV cache replacement)
 
 ```python
 from transformers import AutoModelForCausalLM
-from turboquant_core import patch_qwen35_with_tq, patch_qwen3_with_tq
+from turboquant_core import patch_qwen25_with_tq
 
-# Qwen3.5-9B (hybrid: 8 GatedAttn layers compressed, DeltaNet unchanged)
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-9B", ...)
-cache = patch_qwen35_with_tq(model, bit_width=4)
-# model.generate() now uses compressed KV cache
+# Qwen2.5-3B-Instruct (dense: all 36 layers, 2 KV heads, recommended ablation target)
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-3B-Instruct", ...)
+cache = patch_qwen25_with_tq(
+    model, bit_width=4,
+    key_strategy="mse",       # or "mse+qjl"
+    residual_window=128,      # keep recent 128 tokens in FP16
+)
+# model.generate() now uses compressed KV cache with causal masking.
 cache.clear()  # call between generations
-
-# Qwen3-8B (dense: all 36 layers compressed)
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", ...)
-cache = patch_qwen3_with_tq(model, bit_width=4)
 ```
 
-Patch functions also accept configurable layout overrides:
+Other models:
 
 ```python
-cache = patch_qwen35_with_tq(model, bit_width=4,
-    num_layers=32, full_attn_interval=4, kv_heads=4, head_dim=256)
+from turboquant_core import patch_qwen3_with_tq, patch_qwen35_with_tq
+
+# Qwen3-8B (dense: all 36 layers)
+cache = patch_qwen3_with_tq(model, bit_width=4, key_strategy="mse", residual_window=128)
+
+# Qwen3.5-9B (hybrid: 8 GatedAttn layers compressed, DeltaNet unchanged)
+cache = patch_qwen35_with_tq(model, bit_width=4, key_strategy="mse", residual_window=128)
+```
+
+### Key configuration options
+
+| Parameter | Values | Description |
+|---|---|---|
+| `bit_width` | 2-8 | Bits per quantized value |
+| `key_strategy` | `"mse"`, `"mse+qjl"` | MSE-only (recommended) or MSE + QJL correction |
+| `residual_window` | 0-256 | Recent tokens kept in FP16 (0 = compress all) |
+
+### Compress / decompress (low-level)
+
+```python
+from turboquant_core.backends.qwen import Qwen25DenseKVBackend
+
+backend = Qwen25DenseKVBackend(bit_width=4, key_strategy="mse")
+compressed = backend.compress(K, V, layer_idx=0)
+V_restored = backend.decompress_v(compressed)
+attn_scores = backend.compute_attention_scores(Q, compressed)
 ```
 
 ### Unpatching (model revert)
@@ -109,10 +120,12 @@ from turboquant_core import TurboQuantAdapter
 adapter = TurboQuantAdapter()
 adapter.prepare_model(model, tokenizer, model_cfg, policy_cfg)
 
+# Call between generations to prevent cross-prompt cache contamination:
+adapter.reset_generation_state()
+
 adapter.can_revert()          # True if model is patched
 adapter.revert(model)         # unpatch + clear cache
-adapter.get_state()           # {"adapter", "variant", "bit_width", "seed", "patched", "backend"}
-adapter.update_params()       # False (not yet supported)
+adapter.get_state()           # {"adapter", "variant", "bit_width", ...}
 ```
 
 Policy YAML settings:
@@ -123,8 +136,8 @@ adapter:
   settings:
     bit_width: 4
     seed: 42
-    key_strategy: "mse+qjl"   # or "mse"
-    value_strategy: "mse"
+    key_strategy: "mse"          # or "mse+qjl"
+    residual_window: 128         # recent tokens in FP16
 ```
 
 See `docs/HANDOFF.md` for full wiring instructions.
