@@ -16,7 +16,9 @@ Usage in a workflow-eval policy YAML:
 from __future__ import annotations
 
 from ..backends.qwen import Qwen35KVBackend, Qwen3DenseKVBackend, Qwen25DenseKVBackend
-from ..backends.qwen_hook import patch_qwen35_with_tq, patch_qwen3_with_tq, unpatch_model
+from ..backends.qwen_hook import (
+    patch_qwen35_with_tq, patch_qwen3_with_tq, patch_qwen25_with_tq, unpatch_model,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +68,7 @@ class TurboQuantAdapter:
         bit_width = settings.get("bit_width", 4)
         seed = settings.get("seed", 42)
         residual_window = settings.get("residual_window", 0)
+        key_strategy = settings.get("key_strategy", "mse+qjl")
 
         self._bit_width = bit_width
         self._seed = seed
@@ -77,21 +80,19 @@ class TurboQuantAdapter:
         # Build layout kwargs from model_cfg if provided
         layout = _extract_layout(model_cfg, variant)
 
+        patch_kwargs = dict(
+            bit_width=bit_width, seed=seed,
+            residual_window=residual_window,
+            key_strategy=key_strategy,
+            **layout,
+        )
+
         if variant == "qwen35":
-            self._cache = patch_qwen35_with_tq(
-                model, bit_width=bit_width, seed=seed,
-                residual_window=residual_window, **layout,
-            )
+            self._cache = patch_qwen35_with_tq(model, **patch_kwargs)
         elif variant == "qwen3":
-            self._cache = patch_qwen3_with_tq(
-                model, bit_width=bit_width, seed=seed,
-                residual_window=residual_window, **layout,
-            )
+            self._cache = patch_qwen3_with_tq(model, **patch_kwargs)
         elif variant == "qwen25":
-            self._cache = patch_qwen3_with_tq(
-                model, bit_width=bit_width, seed=seed,
-                residual_window=residual_window, **layout,
-            )
+            self._cache = patch_qwen25_with_tq(model, **patch_kwargs)
         else:
             raise ValueError(f"Unsupported model variant: {variant!r}")
 
