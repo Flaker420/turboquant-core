@@ -315,87 +315,127 @@ def _apply_mask(scores, causal_mask, attention_mask):
     return scores
 
 
+def _expand_kv_for_gqa(tensor, num_kv_heads, num_groups, bsz, seq_len, head_dim):
+    """Expand KV tensor from [bsz, kv_heads, seq, hd] to [bsz, q_heads, seq, hd]."""
+    num_q_heads = num_kv_heads * num_groups
+    expanded = tensor.unsqueeze(2).expand(-1, -1, num_groups, -1, -1)
+    return expanded.reshape(bsz, num_q_heads, seq_len, head_dim)
+
+
 def _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads,
                    causal_mask=None, attention_mask=None):
     """Handle grouped-query attention with TQ cache.
 
-    Qwen3.5-9B: 24 Q heads, 4 KV heads → groups of 6 Q heads per KV head.
+    Supports three data layouts:
+    1. Window-only: all tokens in FP16 (no compressed cache yet)
+    2. Compressed-only: all tokens quantized (residual_window=0)
+    3. Compressed + window: older tokens compressed, recent in FP16
     """
     entry = cache._cache[layer_idx]
+    has_compressed = cache.is_compressible(layer_idx) and isinstance(entry, dict)
+    has_window = cache._window_k[layer_idx] is not None
     bsz = Q.shape[0]
     q_len = Q.shape[2]
     head_dim = Q.shape[3]
-    kv_len = cache.get_seq_length(layer_idx)
     num_groups = num_q_heads // num_kv_heads
 
-    if cache.is_compressible(layer_idx) and isinstance(entry, dict):
-        shape = (bsz, num_kv_heads, kv_len, head_dim)
-
-        # MSE-reconstructed K: [batch, kv_heads, kv_len, head_dim]
-        K_mse = tq_dequantize_mse(
-            entry["k_mse"], entry["k_n"], cache.k_cb, cache.k_rot
-        ).reshape(shape)
-
-        # Expand K for GQA: [batch, kv_heads, kv_len, hd] -> [batch, q_heads, kv_len, hd]
-        K_mse_expanded = K_mse.unsqueeze(2).expand(-1, -1, num_groups, -1, -1)
-        K_mse_expanded = K_mse_expanded.reshape(bsz, num_q_heads, kv_len, head_dim)
-
-        scores_mse = Q @ K_mse_expanded.transpose(-2, -1)
-
-        if cache.key_strategy == "mse+qjl":
-            # QJL correction at KV head granularity, then expand
-            k_qjl_all = entry["k_qjl"].reshape(bsz, num_kv_heads, kv_len, head_dim)
-            k_rn_all = entry["k_rn"].reshape(bsz, num_kv_heads, kv_len)
-            k_n_all = entry["k_n"].reshape(bsz, num_kv_heads, kv_len)
-
-            Q_grouped = Q.reshape(bsz, num_kv_heads, num_groups, q_len, head_dim)
-            correction_per_kv = []
-            for g in range(num_kv_heads):
-                Q_g = Q_grouped[:, g].reshape(bsz * num_groups * q_len, head_dim)
-                Q_qjl = cache.k_qjl.quantize(Q_g).reshape(bsz * num_groups, q_len, head_dim)
-
-                k_qjl_g = k_qjl_all[:, g].unsqueeze(1).expand(-1, num_groups, -1, -1)
-                k_qjl_g = k_qjl_g.reshape(bsz * num_groups, kv_len, head_dim)
-
-                corr = Q_qjl.float() @ k_qjl_g.float().transpose(-2, -1)
-                corr = corr * (math.pi / (2 * head_dim))
-                k_rn_g = k_rn_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
-                k_n_g = k_n_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
-                corr = corr * k_rn_g.reshape(bsz * num_groups, 1, kv_len)
-                corr = corr * k_n_g.reshape(bsz * num_groups, 1, kv_len)
-                correction_per_kv.append(corr.reshape(bsz, num_groups, q_len, kv_len))
-
-            correction = torch.stack(correction_per_kv, dim=1)
-            correction = correction.reshape(bsz, num_q_heads, q_len, kv_len)
-
-            scores = (scores_mse + correction) / (head_dim ** 0.5)
-        else:
-            scores = scores_mse / (head_dim ** 0.5)
-        if causal_mask is not None:
-            scores = _apply_mask(scores, causal_mask, attention_mask)
-        attn = torch.softmax(scores, dim=-1)
-
-        # Decompress V and expand for GQA
-        V_decompressed = tq_dequantize_mse(
-            entry["v_idx"], entry["v_n"], cache.v_cb, cache.v_rot
-        ).reshape(shape)
-        V_expanded = V_decompressed.unsqueeze(2).expand(-1, -1, num_groups, -1, -1)
-        V_expanded = V_expanded.reshape(bsz, num_q_heads, kv_len, head_dim)
-
-        return attn @ V_expanded
-    else:
+    if not cache.is_compressible(layer_idx):
         # Raw (non-compressed) with GQA expansion
         K, V = entry
-        K_expanded = K.unsqueeze(2).expand(-1, -1, num_groups, -1, -1)
-        K_expanded = K_expanded.reshape(bsz, num_q_heads, -1, head_dim)
-        V_expanded = V.unsqueeze(2).expand(-1, -1, num_groups, -1, -1)
-        V_expanded = V_expanded.reshape(bsz, num_q_heads, -1, head_dim)
+        K_expanded = _expand_kv_for_gqa(K, num_kv_heads, num_groups, bsz, K.shape[2], head_dim)
+        V_expanded = _expand_kv_for_gqa(V, num_kv_heads, num_groups, bsz, V.shape[2], head_dim)
 
         scores = Q @ K_expanded.transpose(-2, -1) / (head_dim ** 0.5)
         if causal_mask is not None:
             scores = _apply_mask(scores, causal_mask, attention_mask)
         attn = torch.softmax(scores, dim=-1)
         return attn @ V_expanded
+
+    # --- Window-only path ---
+    if not has_compressed and has_window:
+        wk = cache._window_k[layer_idx]
+        wv = cache._window_v[layer_idx]
+        wk_exp = _expand_kv_for_gqa(wk, num_kv_heads, num_groups, bsz, wk.shape[2], head_dim)
+        wv_exp = _expand_kv_for_gqa(wv, num_kv_heads, num_groups, bsz, wv.shape[2], head_dim)
+
+        scores = Q @ wk_exp.transpose(-2, -1) / (head_dim ** 0.5)
+        if causal_mask is not None:
+            scores = _apply_mask(scores, causal_mask, attention_mask)
+        attn = torch.softmax(scores, dim=-1)
+        return attn @ wv_exp
+
+    if not has_compressed and not has_window:
+        raise ValueError(f"No cache for layer {layer_idx}")
+
+    # --- Compressed path (possibly with residual window) ---
+    compressed_len = cache._compressed_seq_len(layer_idx)
+    c_shape = (bsz, num_kv_heads, compressed_len, head_dim)
+
+    # MSE-reconstructed K from compressed cache
+    K_mse = tq_dequantize_mse(
+        entry["k_mse"], entry["k_n"], cache.k_cb, cache.k_rot
+    ).reshape(c_shape)
+    K_mse_expanded = _expand_kv_for_gqa(
+        K_mse, num_kv_heads, num_groups, bsz, compressed_len, head_dim,
+    )
+    scores_mse = Q @ K_mse_expanded.transpose(-2, -1)
+
+    if cache.key_strategy == "mse+qjl":
+        # QJL correction at KV head granularity, then expand
+        k_qjl_all = entry["k_qjl"].reshape(bsz, num_kv_heads, compressed_len, head_dim)
+        k_rn_all = entry["k_rn"].reshape(bsz, num_kv_heads, compressed_len)
+        k_n_all = entry["k_n"].reshape(bsz, num_kv_heads, compressed_len)
+
+        Q_grouped = Q.reshape(bsz, num_kv_heads, num_groups, q_len, head_dim)
+        correction_per_kv = []
+        for g in range(num_kv_heads):
+            Q_g = Q_grouped[:, g].reshape(bsz * num_groups * q_len, head_dim)
+            Q_qjl = cache.k_qjl.quantize(Q_g).reshape(bsz * num_groups, q_len, head_dim)
+
+            k_qjl_g = k_qjl_all[:, g].unsqueeze(1).expand(-1, num_groups, -1, -1)
+            k_qjl_g = k_qjl_g.reshape(bsz * num_groups, compressed_len, head_dim)
+
+            corr = Q_qjl.float() @ k_qjl_g.float().transpose(-2, -1)
+            corr = corr * (math.pi / (2 * head_dim))
+            k_rn_g = k_rn_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
+            k_n_g = k_n_all[:, g].unsqueeze(1).expand(-1, num_groups, -1)
+            corr = corr * k_rn_g.reshape(bsz * num_groups, 1, compressed_len)
+            corr = corr * k_n_g.reshape(bsz * num_groups, 1, compressed_len)
+            correction_per_kv.append(corr.reshape(bsz, num_groups, q_len, compressed_len))
+
+        correction = torch.stack(correction_per_kv, dim=1)
+        correction = correction.reshape(bsz, num_q_heads, q_len, compressed_len)
+
+        compressed_scores = (scores_mse + correction) / (head_dim ** 0.5)
+    else:
+        compressed_scores = scores_mse / (head_dim ** 0.5)
+
+    # Decompress V from compressed region
+    V_compressed = tq_dequantize_mse(
+        entry["v_idx"], entry["v_n"], cache.v_cb, cache.v_rot
+    ).reshape(c_shape)
+    V_compressed_expanded = _expand_kv_for_gqa(
+        V_compressed, num_kv_heads, num_groups, bsz, compressed_len, head_dim,
+    )
+
+    if has_window:
+        # Combine compressed scores with FP16 window scores
+        wk = cache._window_k[layer_idx]
+        wv = cache._window_v[layer_idx]
+        wk_exp = _expand_kv_for_gqa(wk, num_kv_heads, num_groups, bsz, wk.shape[2], head_dim)
+        wv_exp = _expand_kv_for_gqa(wv, num_kv_heads, num_groups, bsz, wv.shape[2], head_dim)
+        window_scores = Q @ wk_exp.transpose(-2, -1) / (head_dim ** 0.5)
+
+        all_scores = torch.cat([compressed_scores, window_scores], dim=-1)
+        all_V = torch.cat([V_compressed_expanded, wv_exp], dim=2)
+    else:
+        all_scores = compressed_scores
+        all_V = V_compressed_expanded
+
+    if causal_mask is not None:
+        all_scores = _apply_mask(all_scores, causal_mask, attention_mask)
+    attn = torch.softmax(all_scores, dim=-1)
+    return attn @ all_V
 
 
 def unpatch_model(model):
