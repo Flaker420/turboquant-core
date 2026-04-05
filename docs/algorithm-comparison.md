@@ -130,31 +130,117 @@ turboquant-core's approach is solid here and matches the paper faithfully.
 
 ---
 
-## Recommended Priorities for turboquant-core
+## Architecture Ceiling: Dense vs. Hybrid
 
-Based on community findings ranked by impact:
+A critical factor the community hasn't always made explicit: **compressible layer fraction caps end-to-end gains**.
 
-1. **Add residual windowing** -- Keep recent N tokens (e.g., 128) in FP16. Highest quality impact per engineering effort. Multiple repos validate this.
+If compressible layers are fraction `f` of total KV state and you achieve compression ratio `r` on them, end-to-end memory reduction is `1 / ((1 - f) + f / r)`.
 
-2. **Benchmark MSE-only vs MSE+QJL on generation quality** -- Six independent teams found MSE-only superior through softmax. turboquant-core should validate this on its Qwen targets before defaulting to QJL.
+| Model | Compressible layers | f (approx) | At r=5x | At r=10x | Hard ceiling |
+|---|---|---|---|---|---|
+| **Qwen3-8B** | 36/36 (all) | 1.0 | **5.0x** | **10.0x** | Unlimited |
+| **Qwen3.5-9B** | 8/32 (GatedAttn only) | ~0.25 | **1.25x** | **1.29x** | **1.33x** |
 
-3. **Asymmetric K/V bit allocation** -- Independent `key_bit_width`/`value_bit_width` parameters. TheTom's "V compression is free" finding suggests major wins from giving keys more bits.
+Qwen3.5-9B's DeltaNet layers carry opaque recurrent state that TurboQuant cannot compress. Even perfect compression on the 8 GatedAttn layers yields at most 1.33x end-to-end. This means:
 
-4. **Implement bit-packing** -- Current index-tensor storage limits practical compression to ~2x. Bit-packing could push to 4-5x.
+- **Qwen3-8B should be the showcase target** for demonstrating TurboQuant's compression value
+- **Qwen3.5-9B should be framed as the hybrid, bounded-upside case** where the contribution is architectural compatibility, not headline compression ratios
+- Published results should always report **end-to-end memory reduction**, not just per-compressible-layer ratios
 
-5. **Layer-adaptive precision** -- Protect first/last layers at higher precision. Straightforward given existing per-layer architecture.
+0xSero independently warns of the same issue: hybrid/Mamba-like state limits overall TurboQuant impact on those models.
 
-6. **Consider attention-gated V decoding** -- +22.8% decode speedup with no quality cost is compelling, though it's a decode optimization rather than a compression technique.
+---
+
+## Improvement Plan (Reviewer-Validated)
+
+The following plan reflects consensus across this comparison, an independent code reviewer, and community evidence. The key reframing: **the next high-value artifact is a reproducible ablation table, not a code rewrite.** The algorithm works; the question is which configuration point wins for softmax attention on Qwen targets.
+
+### PR0: Correctness and Evaluation Hygiene
+
+**Rationale**: If attention semantics are wrong, every downstream ablation is suspect. tonbistudio had to retract a headline result after discovering a no-compression bug. Fix correctness first.
+
+- [ ] **Causal mask in patched attention** -- `qwen_hook.py` computes softmax over the full cached keys without causal masking. Multi-token prefill can attend non-causally across future positions. Add regression tests comparing logits from patched vs unpatched on multi-token prefill and padded batches.
+- [ ] **Automatic cache clearing** -- Core README says to call `cache.clear()` between generations, but the eval harness's `generate_one()` does not. Cross-prompt cache contamination is a likely correctness bug. Add `reset_generation_state()` to the adapter interface and call it before every prompt.
+- [ ] **Explicit baseline selection** -- Evaluator can shuffle policy order and picks first row per prompt as baseline. Baseline must be explicit by policy name or `is_baseline: true` flag.
+- [ ] **Fix `update_params` signature mismatch** -- Core adapter implements `update_params(self, **kwargs)` but the workflow wrapper calls `self._core.update_params(params)` positionally. Will fail if exercised.
+- [ ] **Stricter reference-answer scoring** -- Numeric checker accepts any matching number anywhere in output. Tighten before using results as canonical.
+
+### PR1: Algorithmic Ablation Matrix
+
+**Rationale**: Community evidence strongly suggests the default configuration is suboptimal. Run a staged ablation on Qwen3-8B (all layers compressible, no architecture ceiling), then transfer winning configs to Qwen3.5-9B.
+
+**Stage 1**: `mse` vs `mse+qjl` x residual window {0, 128, 256}
+- Community prediction: MSE-only + window will win
+- This settles the QJL question on turboquant-core's actual targets
+
+**Stage 2** (conditional on Stage 1 winner): Asymmetric K/V splits
+- K bits: {3, 4, 6} x V bits: {2, 3, 4}
+- Note: optimal V precision is a function of K precision (TheTom reports "V is free" at K=q8_0; 0xSero says V2 is the bottleneck at K=3-bit)
+
+**Stage 3**: Protected layers
+- {none, first/last 1, first/last 2} on winning K/V config
+
+**Stage 4**: Transfer top 3 configs to Qwen3.5-9B and measure end-to-end (not per-layer) gains
+
+**Required code changes to enable ablation**:
+- [ ] Add `key_bit_width` / `value_bit_width` independent parameters
+- [ ] Add `residual_window` parameter (keep recent N tokens in FP16)
+- [ ] Add `protected_layers` list parameter
+- [ ] Keep QJL as an option but benchmark before deciding default
+
+**Measurement discipline** -- Every published row must include:
+- Actual compressed-token count
+- Residual-window length
+- Protected-layer policy
+- Honest bytes/token including all metadata (norms, QJL bits, projection matrices)
+- Whether decode reconstructs full history or operates in compressed domain
+- End-to-end memory reduction (not just per-compressible-layer ratio)
+
+### PR2: Real Compression / Packing
+
+**Rationale**: Without bit-packing, even the winning config from PR1 will show only ~2x compression. This is the gap between "algorithm works" and "library is useful."
+
+- [ ] Pack MSE codes to actual 2/3/4 bits
+- [ ] Pack QJL signs to 1-bit (if QJL survives PR1 ablation)
+- [ ] Compress norms to fp16/bf16 or shared block scales
+- [ ] Avoid materializing full dequantized V unless necessary
+- [ ] Replace `torch.cat` append with paged/blockwise storage
+
+### PR3: Compressed-Domain Compute and Kernels
+
+**Rationale**: After packing, the bottleneck shifts to decode-time dequantization. This is where 0xSero (Triton) and TheTom (Metal) differentiate on runtime.
+
+- [ ] Tiled attention over compressed chunks (avoid full-cache reconstruction)
+- [ ] Fused unpack/dequant + score accumulation for K
+- [ ] Consider attention-gated V decode (TheTom: +22.8% at 32K, model-agnostic)
+- [ ] Vectorized PyTorch interim before Triton/CUDA kernels
+
+### Publication Target
+
+If turboquant-core publishes a rigorous ablation table on Qwen3-8B and Qwen3.5-9B with honest end-to-end numbers and full measurement metadata, it becomes more than another implementation -- it becomes the reference point the community cites. No other repo has done this systematically on these models with this level of accounting discipline.
+
+---
+
+## Community Findings: "V Compression Is Free" -- Nuanced
+
+TheTom/plus reports 2-bit values with zero measurable attention degradation when keys are well-preserved. But 0xSero's audit says 2-bit values are the quality bottleneck in its stack and recommends 4-bit for quality-sensitive workloads.
+
+These findings are not contradictory -- they reflect different K precision baselines:
+- TheTom tests with K at q8_0 (8-bit), giving values enormous headroom
+- 0xSero tests with K at 3-bit, where key noise compounds with value noise
+
+The actionable conclusion: **optimal V precision is a function of K precision**. This is why asymmetric allocation must be independently tunable, not hardcoded. The ablation matrix in PR1 is designed to capture this interaction.
 
 ---
 
 ## Architectural Strengths of turboquant-core
 
-Despite missing community-discovered optimizations, turboquant-core has notable strengths:
+Despite gaps in configuration and systems engineering, turboquant-core has notable strengths:
 
-- **Faithful paper implementation**: Most complete reference of the original TurboQuant algorithms including QJL (which others dropped)
+- **Faithful paper implementation**: Most complete reference of the original TurboQuant algorithms including QJL (which others dropped). QJL should remain available for retrieval/experimental paths even if it stops being the default for softmax attention.
 - **Clean separation of concerns**: core.py / backends / adapters architecture is well-structured
 - **Hybrid architecture support**: Correct handling of Qwen3.5's mixed GatedAttn/DeltaNet layers (only 0xSero also does this)
 - **STE support**: Differentiable quantization path for fine-tuning (unique among all repos)
 - **Eval adapter pattern**: Clean integration with evaluation harnesses
 - **Comprehensive tests**: Theorem-validated unit tests with paper-matching MSE values
+- **Existing `key_strategy` parameter**: Already exposes the MSE vs MSE+QJL lever; extending to asymmetric bits and windowing builds on existing design patterns
