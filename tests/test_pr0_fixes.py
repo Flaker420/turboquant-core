@@ -6,11 +6,9 @@ import pytest
 
 from turboquant_core.core import TQQuantizedCache
 from turboquant_core.backends.qwen import (
-    Qwen35KVBackend, Qwen3DenseKVBackend, Qwen25DenseKVBackend,
+    Qwen35KVBackend, Qwen25DenseKVBackend,
 )
-from turboquant_core.backends.qwen_hook import (
-    patch_qwen35_with_tq, patch_qwen3_with_tq, unpatch_model,
-)
+from turboquant_core.backends.qwen_hook import patch_qwen3_with_tq
 from turboquant_core.adapters.workflow_eval import (
     TurboQuantAdapter, _detect_variant,
 )
@@ -70,7 +68,7 @@ class TestCausalMask:
     def test_prefill_is_causal(self):
         """Multi-token prefill must not attend to future positions."""
         model = _make_qwen3_mock()
-        cache = patch_qwen3_with_tq(model, bit_width=4)
+        patch_qwen3_with_tq(model, bit_width=4)
 
         bsz, seq_len = 1, 8
         hidden_size = 16 * 128
@@ -95,7 +93,6 @@ class TestCausalMask:
 
         bsz = 1
         hidden_size = 16 * 128
-        seq_len = 4
 
         # Create two inputs: same first 2 tokens, different last 2
         torch.manual_seed(42)
@@ -123,7 +120,7 @@ class TestCausalMask:
     def test_incremental_decode_after_prefill(self):
         """Verify that incremental single-token decode works after prefill."""
         model = _make_qwen3_mock()
-        cache = patch_qwen3_with_tq(model, bit_width=4)
+        patch_qwen3_with_tq(model, bit_width=4)
 
         bsz = 1
         hidden_size = 16 * 128
