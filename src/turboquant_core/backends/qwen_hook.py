@@ -150,6 +150,7 @@ def _patch_attention_forward(attn_module, cache, layer_idx):
     3. Computes attention using QJL-corrected scores
     4. Returns the attention output
     """
+    attn_module._tq_original_forward = attn_module.forward
     original_forward = attn_module.forward
 
     @functools.wraps(original_forward)
@@ -282,6 +283,35 @@ def _gqa_attention(Q, cache, layer_idx, num_q_heads, num_kv_heads):
         scores = Q @ K_expanded.transpose(-2, -1) / (head_dim ** 0.5)
         attn = torch.softmax(scores, dim=-1)
         return attn @ V_expanded
+
+
+def unpatch_model(model):
+    """Restore original forward methods on all TQ-patched attention modules.
+
+    Iterates all transformer layers and, for any attention module that has the
+    ``_tq_original_forward`` attribute (set during patching), restores the
+    original forward and removes the marker attribute.
+
+    Args:
+        model: A patched HuggingFace model.
+
+    Returns:
+        int: Number of layers that were unpatched.
+    """
+    layers = _get_model_layers(model)
+    if layers is None:
+        return 0
+
+    count = 0
+    for layer in layers:
+        attn = _get_attention_module(layer)
+        if attn is None:
+            continue
+        if hasattr(attn, '_tq_original_forward'):
+            attn.forward = attn._tq_original_forward
+            del attn._tq_original_forward
+            count += 1
+    return count
 
 
 def _apply_rotary_pos_emb(q, k, cos, sin):
