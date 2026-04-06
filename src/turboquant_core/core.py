@@ -373,7 +373,8 @@ class TQQuantizedCache:
     def __init__(self, num_layers=32, interval=4,
                  kv_head_dim=256, num_kv_heads=4,
                  bit_width=4, seed=42, device=torch.device("cpu"),
-                 residual_window=0, key_strategy="mse+qjl"):
+                 residual_window=0, key_strategy="mse+qjl",
+                 value_strategy="mse"):
         self.num_layers = num_layers
         self.ga_indices = {i for i in range(num_layers) if (i + 1) % interval == 0}
         self.kv_head_dim = kv_head_dim
@@ -381,6 +382,12 @@ class TQQuantizedCache:
         self.device = device
         self.residual_window = residual_window
         self.key_strategy = key_strategy
+        if value_strategy != "mse":
+            raise ValueError(
+                f"Invalid value_strategy {value_strategy!r}. "
+                "Only 'mse' is currently supported for value compression."
+            )
+        self.value_strategy = value_strategy
 
         if key_strategy == "mse+qjl":
             # K: (b-1)-bit MSE + 1-bit QJL

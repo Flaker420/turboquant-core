@@ -212,6 +212,7 @@ class TestTurboQuantAdapter:
             "seed": 123,
             "residual_window": 8,
             "key_strategy": "mse",
+            "value_strategy": "mse",
         }
 
     def test_describe_defaults(self):
@@ -223,6 +224,7 @@ class TestTurboQuantAdapter:
             "seed": 42,
             "residual_window": 0,
             "key_strategy": "mse+qjl",
+            "value_strategy": "mse",
         }
 
     def test_cleanup(self):
