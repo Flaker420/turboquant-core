@@ -73,6 +73,7 @@ class TurboQuantAdapter:
         seed = settings.get("seed", 42)
         residual_window = settings.get("residual_window", 0)
         key_strategy = settings.get("key_strategy", "mse+qjl")
+        value_strategy = settings.get("value_strategy", "mse")
 
         self._bit_width = bit_width
         self._seed = seed
@@ -88,6 +89,7 @@ class TurboQuantAdapter:
             bit_width=bit_width, seed=seed,
             residual_window=residual_window,
             key_strategy=key_strategy,
+            value_strategy=value_strategy,
             **layout,
         )
 
@@ -111,6 +113,7 @@ class TurboQuantAdapter:
             "seed": settings.get("seed", 42),
             "residual_window": settings.get("residual_window", 0),
             "key_strategy": settings.get("key_strategy", "mse+qjl"),
+            "value_strategy": settings.get("value_strategy", "mse"),
         }
 
     def can_revert(self) -> bool:

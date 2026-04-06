@@ -45,7 +45,7 @@ from ..core import (
 def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
                          num_layers=32, full_attn_interval=4,
                          kv_heads=4, head_dim=256, residual_window=0,
-                         key_strategy="mse+qjl"):
+                         key_strategy="mse+qjl", value_strategy="mse"):
     """Patch a Qwen3.5 model to use TurboQuant compressed KV cache.
 
     Args:
@@ -70,6 +70,7 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
         bit_width=bit_width, seed=seed, device=device,
         residual_window=residual_window,
         key_strategy=key_strategy,
+        value_strategy=value_strategy,
     )
 
     # Find the attention layers in the model
@@ -96,7 +97,8 @@ def patch_qwen35_with_tq(model, bit_width=4, seed=42, device=None, *,
 
 def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None, *,
                         num_layers=36, kv_heads=8, head_dim=128,
-                        residual_window=0, key_strategy="mse+qjl"):
+                        residual_window=0, key_strategy="mse+qjl",
+                        value_strategy="mse"):
     """Patch a Qwen3-8B model to use TurboQuant compressed KV cache.
 
     All layers are dense attention and compressible.
@@ -122,6 +124,7 @@ def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None, *,
         bit_width=bit_width, seed=seed, device=device,
         residual_window=residual_window,
         key_strategy=key_strategy,
+        value_strategy=value_strategy,
     )
 
     layers = _get_model_layers(model)
@@ -143,7 +146,8 @@ def patch_qwen3_with_tq(model, bit_width=4, seed=42, device=None, *,
 
 def patch_qwen25_with_tq(model, bit_width=4, seed=42, device=None, *,
                          num_layers=36, kv_heads=2, head_dim=128,
-                         residual_window=0, key_strategy="mse+qjl"):
+                         residual_window=0, key_strategy="mse+qjl",
+                         value_strategy="mse"):
     """Patch a Qwen2.5 model to use TurboQuant compressed KV cache.
 
     Qwen2.5-3B-Instruct: 36 dense attention layers, 2 KV heads, head_dim 128.
@@ -173,6 +177,7 @@ def patch_qwen25_with_tq(model, bit_width=4, seed=42, device=None, *,
         bit_width=bit_width, seed=seed, device=device,
         residual_window=residual_window,
         key_strategy=key_strategy,
+        value_strategy=value_strategy,
     )
 
     layers = _get_model_layers(model)

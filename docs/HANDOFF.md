@@ -29,6 +29,7 @@ This document covers what `turboquant-core` implements, how to wire it into the 
 |---|---|---|---|---|---|
 | `Qwen35KVBackend` | Qwen3.5-9B | 8 of 32 (GatedAttn) | 4 | 256 | K→TQ_prod, V→TQ_MSE |
 | `Qwen3DenseKVBackend` | Qwen3-8B | All 36 | 8 | 128 | K→TQ_prod, V→TQ_MSE |
+| `Qwen25DenseKVBackend` | Qwen2.5-3B-Instruct | All 36 | 2 | 128 | K→TQ_prod, V→TQ_MSE |
 
 Both backends implement: `is_compressible(layer_idx)`, `compress(K, V, layer_idx)`, `decompress_v(compressed)`, `compute_attention_scores(Q, compressed)`.
 
@@ -38,6 +39,7 @@ Both backends implement: `is_compressible(layer_idx)`, `compress(K, V, layer_idx
 
 - **`patch_qwen35_with_tq(model, bit_width=4)`** — Monkey-patches Qwen3.5-9B attention to use TQ compressed KV cache. Handles GQA expansion (24 Q heads / 4 KV heads). Accepts layout overrides.
 - **`patch_qwen3_with_tq(model, bit_width=4)`** — Same for Qwen3-8B (all 36 layers, 32 Q heads / 8 KV heads). Accepts layout overrides.
+- **`patch_qwen25_with_tq(model, bit_width=4)`** — Same for Qwen2.5-3B-Instruct (all 36 layers, 16 Q heads / 2 KV heads, head_dim 128). Accepts layout overrides and `key_strategy` / `value_strategy`. See `README.md` for the canonical usage example.
 - **`unpatch_model(model)`** — Restores original attention forward methods on all TQ-patched layers.
 
 ### Adapter (`src/turboquant_core/adapters/workflow_eval.py`)
@@ -67,8 +69,10 @@ adapter:
     bit_width: 4
     seed: 42
     key_strategy: "mse+qjl"    # optional, default
-    value_strategy: "mse"       # optional, default
+    value_strategy: "mse"       # optional, default; only "mse" is currently supported
 ```
+
+Both `key_strategy` and `value_strategy` are forwarded by `TurboQuantAdapter.prepare_model()` into the underlying `patch_qwen{25,3,35}_with_tq()` call and recorded in `describe()` for run provenance. `value_strategy` is currently restricted to `"mse"`; passing any other value raises `ValueError` from `TQQuantizedCache`.
 
 The eval harness's `TurboQuantAdapter` bridge delegates `can_revert()`, `revert()`, `get_state()`, `reset_generation_state()`, `describe()`, and `cleanup()` directly to core. `update_params()` raises `NotImplementedError` by design.
 

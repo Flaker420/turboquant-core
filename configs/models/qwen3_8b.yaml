@@ -1,13 +1,15 @@
-# Qwen3-8B KV cache compression config (dense, all layers uniform)
+# Qwen3-8B KV cache compression config (dense, all layers uniform).
+# Top-level fields are consumed directly by
+# turboquant_core.adapters.workflow_eval.TurboQuantAdapter._extract_layout.
 
-model:
-  name: "Qwen/Qwen3-8B"
+name: "Qwen/Qwen3-8B"
+
+layout:
   num_layers: 36
-  full_attention_interval: null  # all layers are softmax attention
+  kv_heads: 8
+  head_dim: 128
 
 kv_cache:
   method: "turboquant_prod"
   bit_width: 4
-  kv_heads: 8
-  head_dim: 128
   compressible_layers: 36       # all layers have KV cache
