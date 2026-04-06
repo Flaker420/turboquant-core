@@ -6,8 +6,8 @@ from turboquant_core.core import (
     TQGatedAttnKVCache,
     TQQuantizedCache,
     # Experimental, untested wrappers — importable but excluded from __all__:
-    TQActivationCheckpoint,
-    TQLoRAStorage,
+    TQActivationCheckpoint as TQActivationCheckpoint,
+    TQLoRAStorage as TQLoRAStorage,
     tq_quantize_mse,
     tq_dequantize_mse,
     tq_quantize_mse_ste,

@@ -1,7 +1,6 @@
 """Tests for _extract_layout schema reconciliation (Section A1, A2)."""
 from pathlib import Path
 
-import pytest
 import yaml
 
 from turboquant_core.adapters.workflow_eval import _extract_layout

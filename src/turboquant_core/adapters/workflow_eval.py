@@ -18,11 +18,11 @@ from __future__ import annotations
 import logging
 
 from ..backends.qwen import Qwen35KVBackend, Qwen3DenseKVBackend, Qwen25DenseKVBackend
-
-logger = logging.getLogger(__name__)
 from ..backends.qwen_hook import (
     patch_qwen35_with_tq, patch_qwen3_with_tq, patch_qwen25_with_tq, unpatch_model,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
