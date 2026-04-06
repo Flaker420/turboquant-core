@@ -163,7 +163,7 @@ The following plan reflects consensus across this comparison, an independent cod
 - [x] **Causal mask in patched attention** -- `qwen_hook.py` now builds a proper causal mask. Both `_gqa_attention` and `TQQuantizedCache.compute_attention` accept `causal_mask` and `attention_mask`. Regression tests added for prefill causality and incremental decode. **Remaining**: padded-batch parity tests against unpatched attention.
 - [x] **Automatic cache clearing** -- `reset_generation_state()` added to `TurboQuantAdapter`. Harnesses should call this between generations.
 - [ ] **Explicit baseline selection** -- Evaluator can shuffle policy order and picks first row per prompt as baseline. Baseline must be explicit by policy name or `is_baseline: true` flag. *(Lives in turboquant-workflow-eval, not this repo.)*
-- [x] **Fix `update_params` signature mismatch** -- Now accepts both `update_params(params_dict)` and `update_params(**kwargs)`.
+- [x] **`update_params` is intentionally unsupported** -- Now raises `NotImplementedError` so silent param drift can't happen. Callers must `revert(model)` + `prepare_model(...)` to change settings.
 - [ ] **Stricter reference-answer scoring** -- Numeric checker accepts any matching number anywhere in output. Tighten before using results as canonical. *(Lives in turboquant-workflow-eval, not this repo.)*
 - [x] **Fix duplicated V quantization** -- `Qwen35KVBackend.compress()` was calling `tq_quantize_mse` twice for V. Fixed to call once.
 

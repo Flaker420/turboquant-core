@@ -15,10 +15,14 @@ Usage in a workflow-eval policy YAML:
 
 from __future__ import annotations
 
+import logging
+
 from ..backends.qwen import Qwen35KVBackend, Qwen3DenseKVBackend, Qwen25DenseKVBackend
 from ..backends.qwen_hook import (
     patch_qwen35_with_tq, patch_qwen3_with_tq, patch_qwen25_with_tq, unpatch_model,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +109,8 @@ class TurboQuantAdapter:
             "adapter": self.name,
             "bit_width": settings.get("bit_width", 4),
             "seed": settings.get("seed", 42),
-            "scope": settings.get("scope", "full_attention_only"),
+            "residual_window": settings.get("residual_window", 0),
+            "key_strategy": settings.get("key_strategy", "mse+qjl"),
         }
 
     def can_revert(self) -> bool:
@@ -154,17 +159,24 @@ class TurboQuantAdapter:
     def update_params(self, params: dict = None, **kwargs) -> bool:
         """Update compression parameters on a live model.
 
-        Not yet supported — requires revert + re-prepare.
-
-        Accepts both positional dict and keyword arguments for compatibility
-        with workflow-eval wrappers that call update_params(params).
-
-        Returns:
-            False always.
+        Not supported: changing parameters requires reverting and re-preparing
+        the model. Callers should call ``revert(model)`` followed by
+        ``prepare_model(...)`` with the new policy.
         """
-        return False
+        raise NotImplementedError(
+            "TurboQuantAdapter.update_params is not supported; "
+            "call revert(model) and prepare_model(...) again with new settings."
+        )
 
     def cleanup(self, model) -> None:
+        """Fully revert the model and drop cached state.
+
+        Equivalent to ``revert(model)`` for already-patched models, plus
+        a no-op for never-prepared adapters. After this call the model is
+        guaranteed to be unpatched.
+        """
+        if self._patched and model is not None:
+            unpatch_model(model)
         if self._cache is not None:
             self._cache.clear()
             self._cache = None
@@ -186,7 +198,13 @@ def _detect_variant(model_cfg: dict, settings: dict) -> tuple[str, type | None]:
                 return vid, backend_cls
         return vid, None
 
-    name = model_cfg.get("name", "")
+    name = model_cfg.get("name")
+    if not name:
+        raise ValueError(
+            "Cannot detect model variant: model_cfg['name'] is missing or empty. "
+            "Did you forget to bridge 'model_name' from the harness config? "
+            "Alternatively, set 'model_variant' in policy settings."
+        )
     for pattern, variant_id, backend_cls in _VARIANT_REGISTRY:
         if pattern in name or pattern.lower() in name.lower():
             return variant_id, backend_cls
@@ -197,16 +215,40 @@ def _detect_variant(model_cfg: dict, settings: dict) -> tuple[str, type | None]:
     )
 
 
+_LAYOUT_ALIASES = {
+    "full_attention_interval": "full_attn_interval",
+    "total_lm_layers": "num_layers",
+}
+
+_VARIANT_LAYOUT_KEYS = {
+    "qwen35": ("num_layers", "full_attn_interval", "kv_heads", "head_dim"),
+    "qwen3": ("num_layers", "kv_heads", "head_dim"),
+    "qwen25": ("num_layers", "kv_heads", "head_dim"),
+}
+
+
 def _extract_layout(model_cfg: dict, variant: str) -> dict:
-    """Extract layout overrides from model_cfg, if present."""
-    layout = model_cfg.get("layout", {})
-    kwargs = {}
-    if variant == "qwen35":
-        for key in ("num_layers", "full_attn_interval", "kv_heads", "head_dim"):
-            if key in layout:
-                kwargs[key] = layout[key]
-    elif variant in ("qwen3", "qwen25"):
-        for key in ("num_layers", "kv_heads", "head_dim"):
-            if key in layout:
-                kwargs[key] = layout[key]
-    return kwargs
+    """Extract layout overrides from model_cfg.
+
+    Reads from both ``model_cfg["layout"]`` (nested) and the top level of
+    ``model_cfg``, accepting aliases like ``full_attention_interval`` for
+    ``full_attn_interval`` and ``total_lm_layers`` for ``num_layers``.
+    """
+    allowed = _VARIANT_LAYOUT_KEYS.get(variant, ())
+    if not allowed:
+        return {}
+
+    nested = model_cfg.get("layout", {}) or {}
+    merged: dict = {}
+    # top-level first, nested overrides
+    for source in (model_cfg, nested):
+        for raw_key, value in source.items():
+            key = _LAYOUT_ALIASES.get(raw_key, raw_key)
+            if key in allowed:
+                merged[key] = value
+            elif source is nested:
+                logger.warning(
+                    "Ignoring unknown layout key %r in model_cfg['layout'] "
+                    "for variant %r", raw_key, variant,
+                )
+    return merged

@@ -125,8 +125,14 @@ adapter.reset_generation_state()
 
 adapter.can_revert()          # True if model is patched
 adapter.revert(model)         # unpatch + clear cache
-adapter.get_state()           # {"adapter", "variant", "bit_width", ...}
+adapter.cleanup(model)        # equivalent to revert(model) — fully unpatches
+adapter.get_state()           # {adapter, variant, bit_width, seed, patched, backend}
+adapter.describe(policy_cfg)  # {adapter, bit_width, seed, residual_window, key_strategy}
 ```
+
+`update_params()` is **not supported** and raises `NotImplementedError`. To
+change compression parameters, call `revert(model)` followed by a fresh
+`prepare_model(...)`.
 
 Policy YAML settings:
 
@@ -140,6 +146,9 @@ adapter:
     residual_window: 128         # recent tokens in FP16
 ```
 
+Both `key_strategy` and `residual_window` are surfaced by `describe()` so
+the eval harness can record them per row.
+
 See `docs/HANDOFF.md` for full wiring instructions.
 
 ## Install
@@ -148,6 +157,18 @@ See `docs/HANDOFF.md` for full wiring instructions.
 pip install -e .
 # With dev tools: pip install -e ".[dev]"
 ```
+
+### Supported versions
+
+| Dependency | Range |
+|---|---|
+| Python | `>=3.10` |
+| `torch` | `>=2.5,<3` |
+| `transformers` | `>=4.45,<4.60` |
+
+The upper bound on `transformers` exists because the Qwen attention hooks
+in `backends/qwen_hook.py` reach into internal KV-cache APIs that have
+historically broken across major releases.
 
 ## Tests
 

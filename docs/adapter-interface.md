@@ -98,11 +98,14 @@ class TurboQuantAdapter:
     def get_state(self) -> dict:
         """Return {adapter, variant, bit_width, seed, patched, backend}."""
 
-    def update_params(self, **kwargs) -> bool:
-        """Not yet supported. Returns False."""
+    def reset_generation_state(self) -> None:
+        """Clear KV cache between generations (call before each prompt)."""
+
+    def update_params(self, params=None, **kwargs) -> bool:
+        """Not supported — raises NotImplementedError. Revert + re-prepare instead."""
 
     def cleanup(self, model) -> None:
-        """Clear cache (does not unpatch)."""
+        """Fully unpatch the model and clear cache (equivalent to revert)."""
 ```
 
 The adapter reads these settings from `policy_cfg["settings"]`:
@@ -115,14 +118,31 @@ The adapter reads these settings from `policy_cfg["settings"]`:
 | `value_strategy` | `"mse"` | V quantization strategy |
 | `model_variant` | auto-detect | Explicit variant override |
 
-Layout overrides can be provided via `model_cfg["layout"]`:
+Layout overrides can be provided either nested under `model_cfg["layout"]`
+or at the top level of `model_cfg`. The long-form aliases
+`full_attention_interval` (→ `full_attn_interval`) and `total_lm_layers`
+(→ `num_layers`) are also accepted:
 
 ```python
+# Nested form
 model_cfg = {
     "name": "Qwen/Qwen3.5-9B",
     "layout": {"num_layers": 32, "full_attn_interval": 4, "kv_heads": 4, "head_dim": 256},
 }
+
+# Top-level form with long aliases (equivalent)
+model_cfg = {
+    "name": "Qwen/Qwen3.5-9B",
+    "total_lm_layers": 32,
+    "full_attention_interval": 4,
+    "kv_heads": 4,
+    "head_dim": 256,
+}
 ```
+
+A missing or empty `model_cfg["name"]` (with no `model_variant` override)
+raises a clear `ValueError` referencing the `model_name` bridge — useful
+when wiring through harness configs that use a different field name.
 
 ## Variant registry
 
