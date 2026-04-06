@@ -42,7 +42,7 @@ Both backends implement: `is_compressible(layer_idx)`, `compress(K, V, layer_idx
 
 ### Adapter (`src/turboquant_core/adapters/workflow_eval.py`)
 
-- **`TurboQuantAdapter`** — Duck-types the eval harness's `CompressionAdapter` interface. Supports `prepare_model()`, `can_revert()`, `revert()`, `get_state()`, `update_params()`, `describe()`, `cleanup()`.
+- **`TurboQuantAdapter`** — Duck-types the eval harness's `CompressionAdapter` interface. Supports `prepare_model()`, `can_revert()`, `revert()`, `get_state()`, `reset_generation_state()`, `describe()`, `cleanup()` (fully unpatches). `update_params()` is intentionally unsupported and raises `NotImplementedError` — callers must `revert` + `prepare_model` again.
 - **`register_variant()`** — Register custom model variants for auto-detection.
 
 ---
@@ -70,7 +70,7 @@ adapter:
     value_strategy: "mse"       # optional, default
 ```
 
-The eval harness's `hasattr`-based delegation automatically picks up `can_revert()`, `revert()`, `get_state()`, and `update_params()` — no code changes needed on the eval side.
+The eval harness's `TurboQuantAdapter` bridge delegates `can_revert()`, `revert()`, `get_state()`, `reset_generation_state()`, `describe()`, and `cleanup()` directly to core. `update_params()` raises `NotImplementedError` by design.
 
 ### Step 3 (alternative): Direct backend adapter
 
