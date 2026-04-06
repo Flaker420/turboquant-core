@@ -272,24 +272,21 @@ class TestAdapterFixes:
         adapter = TurboQuantAdapter()
         adapter.reset_generation_state()  # should not raise
 
-    def test_update_params_positional_dict(self):
-        """update_params should accept a positional dict argument."""
+    def test_update_params_positional_dict_raises(self):
+        """update_params is not supported and must raise NotImplementedError."""
         adapter = TurboQuantAdapter()
-        # This is how workflow-eval wrappers call it
-        result = adapter.update_params({"bit_width": 8})
-        assert result is False
+        with pytest.raises(NotImplementedError):
+            adapter.update_params({"bit_width": 8})
 
-    def test_update_params_kwargs(self):
-        """update_params should also accept kwargs (original signature)."""
+    def test_update_params_kwargs_raises(self):
         adapter = TurboQuantAdapter()
-        result = adapter.update_params(bit_width=8)
-        assert result is False
+        with pytest.raises(NotImplementedError):
+            adapter.update_params(bit_width=8)
 
-    def test_update_params_no_args(self):
-        """update_params should work with no arguments."""
+    def test_update_params_no_args_raises(self):
         adapter = TurboQuantAdapter()
-        result = adapter.update_params()
-        assert result is False
+        with pytest.raises(NotImplementedError):
+            adapter.update_params()
 
 
 # ---------------------------------------------------------------------------
