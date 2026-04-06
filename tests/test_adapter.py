@@ -91,8 +91,12 @@ class TestDetectVariant:
             _detect_variant({"name": "GPT-4"}, {})
 
     def test_empty_name_raises(self):
-        with pytest.raises(ValueError, match="Cannot detect model variant"):
+        with pytest.raises(ValueError, match="model_cfg\\['name'\\] is missing"):
             _detect_variant({}, {})
+
+    def test_missing_name_with_model_name_key_hints(self):
+        with pytest.raises(ValueError, match="model_name"):
+            _detect_variant({"model_name": "Qwen/Qwen3.5-9B"}, {})
 
 
 # ---------------------------------------------------------------------------
@@ -196,14 +200,18 @@ class TestTurboQuantAdapter:
     def test_describe(self):
         adapter = TurboQuantAdapter()
         policy_cfg = {
-            "settings": {"bit_width": 4, "seed": 123, "scope": "all_layers"},
+            "settings": {
+                "bit_width": 4, "seed": 123,
+                "residual_window": 8, "key_strategy": "mse",
+            },
         }
         desc = adapter.describe(policy_cfg)
         assert desc == {
             "adapter": "turboquant",
             "bit_width": 4,
             "seed": 123,
-            "scope": "all_layers",
+            "residual_window": 8,
+            "key_strategy": "mse",
         }
 
     def test_describe_defaults(self):
@@ -213,7 +221,8 @@ class TestTurboQuantAdapter:
             "adapter": "turboquant",
             "bit_width": 4,
             "seed": 42,
-            "scope": "full_attention_only",
+            "residual_window": 0,
+            "key_strategy": "mse+qjl",
         }
 
     def test_cleanup(self):
@@ -317,6 +326,17 @@ class TestTurboQuantAdapter:
 
     # -- update_params ---------------------------------------------------------
 
-    def test_update_params_returns_false(self):
+    def test_update_params_raises(self):
         adapter = TurboQuantAdapter()
-        assert adapter.update_params() is False
+        with pytest.raises(NotImplementedError):
+            adapter.update_params()
+
+    def test_cleanup_unpatches_model(self):
+        adapter = TurboQuantAdapter()
+        model = _make_qwen35_mock()
+        adapter.prepare_model(model, None, {"name": "Qwen/Qwen3.5-9B"}, {"settings": {}})
+        assert hasattr(model.model.layers[3].self_attn.forward, '__wrapped__')
+        adapter.cleanup(model)
+        assert not hasattr(model.model.layers[3].self_attn.forward, '__wrapped__')
+        assert adapter._cache is None
+        assert adapter._patched is False
